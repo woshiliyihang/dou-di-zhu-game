@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<items version="2" >
+
+    <item
+        jar="D:\androidsource\cocos2d-android1\app\libs\android-async-http-1.4.3.jar"
+        jumboMode="false"
+        revision="22.0.1"
+        sha1="f70e680861fdf9449819003e7799a4e9aca047f8">
+        <dex dex="D:\androidsource\cocos2d-android1\app\build\intermediates\pre-dexed\debug\android-async-http-1.4.3-4e6a9305990102260e2d6e88b483c715ecb6f87e.jar" />
+    </item>
+    <item
+        jar="D:\androidsource\cocos2d-android1\app\libs\cocos2d-android.jar"
+        jumboMode="false"
+        revision="22.0.1"
+        sha1="9f6c9f5ae05ee941b074037d1f64fa75fd7b3690">
+        <dex dex="D:\androidsource\cocos2d-android1\app\build\intermediates\pre-dexed\debug\cocos2d-android-501ec9a1c4b95cd6ddc4d3c7abe4024dbd36833e.jar" />
+    </item>
+
+</items>
