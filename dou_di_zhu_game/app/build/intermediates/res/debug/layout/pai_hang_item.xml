@@ -4,7 +4,6 @@
     android:layout_height="match_parent"
     android:orientation="horizontal">
 
-
     <TextView
         android:id="@+id/one"
         android:textSize="14sp"
@@ -30,4 +29,4 @@
         android:layout_width="wrap_content"
         android:layout_height="wrap_content" />
 
-</LinearLayout><!-- From: file:/D:/androidsource/cocos2d-android1/app/src/main/res/layout/pai_hang_item.xml -->
+</LinearLayout><!-- From: file:/D:/git_test/game/dou-di-zhu-game/dou_di_zhu_game/app/src/main/res/layout/pai_hang_item.xml -->

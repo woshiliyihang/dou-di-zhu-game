@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <!-- From: file:/D:/androidsource/cocos2d-android1/app/src/main/res/values/strings.xml -->
+    <!-- From: file:/D:/git_test/game/dou-di-zhu-game/dou_di_zhu_game/app/src/main/res/values/strings.xml -->
     <eat-comment/>
     <color name="ao_hong">#B22222</color>
     <color name="hei_se">#292421</color>
@@ -8,7 +8,7 @@
     <string name="hello_world">欢饮来斗地主</string>
     <string name="menu_settings">菜单</string>
     <string name="title_activity_my_five">斗地主</string>
-    <!-- From: file:/D:/androidsource/cocos2d-android1/app/src/main/res/values/style.xml -->
+    <!-- From: file:/D:/git_test/game/dou-di-zhu-game/dou_di_zhu_game/app/src/main/res/values/style.xml -->
     <eat-comment/>
     <style name="Theme" parent="android:Theme.Light">
         <item name="android:windowNoTitle">true</item>

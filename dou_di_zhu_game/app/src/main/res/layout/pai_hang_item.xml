@@ -4,7 +4,6 @@
     android:layout_height="match_parent"
     android:orientation="horizontal">
 
-
     <TextView
         android:id="@+id/one"
         android:textSize="14sp"
