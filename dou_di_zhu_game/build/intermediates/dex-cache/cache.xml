@@ -2,32 +2,18 @@
 <items version="2" >
 
     <item
-        jar="D:\git_test\game\dou-di-zhu-game\dou_di_zhu_game\app\libs\android-async-http-1.4.3.jar"
-        jumboMode="false"
-        revision="22.0.1"
-        sha1="f70e680861fdf9449819003e7799a4e9aca047f8">
-        <dex dex="D:\git_test\game\dou-di-zhu-game\dou_di_zhu_game\app\build\intermediates\pre-dexed\debug\android-async-http-1.4.3-8e6d17c022201ea7368ebfea811a9f987b498924.jar" />
-    </item>
-    <item
-        jar="D:\androidsource\cocos2d-android1\app\libs\cocos2d-android.jar"
-        jumboMode="false"
-        revision="22.0.1"
-        sha1="9f6c9f5ae05ee941b074037d1f64fa75fd7b3690">
-        <dex dex="D:\androidsource\cocos2d-android1\app\build\intermediates\pre-dexed\debug\cocos2d-android-501ec9a1c4b95cd6ddc4d3c7abe4024dbd36833e.jar" />
-    </item>
-    <item
-        jar="D:\androidsource\cocos2d-android1\app\libs\android-async-http-1.4.3.jar"
-        jumboMode="false"
-        revision="22.0.1"
-        sha1="f70e680861fdf9449819003e7799a4e9aca047f8">
-        <dex dex="D:\androidsource\cocos2d-android1\app\build\intermediates\pre-dexed\debug\android-async-http-1.4.3-4e6a9305990102260e2d6e88b483c715ecb6f87e.jar" />
-    </item>
-    <item
         jar="D:\git_test\game\dou-di-zhu-game\dou_di_zhu_game\app\libs\cocos2d-android.jar"
         jumboMode="false"
         revision="22.0.1"
         sha1="9f6c9f5ae05ee941b074037d1f64fa75fd7b3690">
-        <dex dex="D:\git_test\game\dou-di-zhu-game\dou_di_zhu_game\app\build\intermediates\pre-dexed\debug\cocos2d-android-c2496168f8d60e5fbd6b6b6687cb78efe677d3a8.jar" />
+        <dex dex="D:\git_test\game\dou-di-zhu-game\dou_di_zhu_game\app\build\intermediates\pre-dexed\debug\cocos2d-android_c2496168f8d60e5fbd6b6b6687cb78efe677d3a8.jar" />
+    </item>
+    <item
+        jar="D:\git_test\game\dou-di-zhu-game\dou_di_zhu_game\app\libs\android-async-http-1.4.3.jar"
+        jumboMode="false"
+        revision="22.0.1"
+        sha1="f70e680861fdf9449819003e7799a4e9aca047f8">
+        <dex dex="D:\git_test\game\dou-di-zhu-game\dou_di_zhu_game\app\build\intermediates\pre-dexed\debug\android-async-http-1.4.3_8e6d17c022201ea7368ebfea811a9f987b498924.jar" />
     </item>
 
 </items>
