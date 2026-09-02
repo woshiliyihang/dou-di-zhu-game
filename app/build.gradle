@@ -47,13 +47,10 @@ android {
         }
     }
 
-    // 锁死编译目标，不依赖运行 gradlew 的那个 JDK 恰好是 17
-    java {
-        toolchain {
-            languageVersion = JavaLanguageVersion.of(17)
-        }
-    }
-
+    // 编译目标锁 17。刻意不用 java.toolchain 锁 JDK 版本：
+    // Android Studio 自带的 JDK 可能是 17 也可能是 21，写死 17 会在没有配置
+    // toolchain resolver 的机器上直接构建失败。用 -source/-target 17 就够了，
+    // 本机/CI 只要有 JDK 17 或 21 都能编。
     compileOptions {
         sourceCompatibility JavaVersion.VERSION_17
         targetCompatibility JavaVersion.VERSION_17

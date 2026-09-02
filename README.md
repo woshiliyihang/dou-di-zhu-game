@@ -1,5 +1,8 @@
 # 离线实时语音翻译（红米 K40 Pro / 骁龙 888）
 
+> **要在本地 Android Studio 里编译 / 上真机测试？先看 [HANDOVER.md](HANDOVER.md)**
+> （环境要求、导入步骤、避坑、真机自检清单）。本文面向"这个东西是怎么做出来、为什么这么选"。
+
 一个**完全离线**的实时语音翻译 App：按住开始，说话，屏幕上同时出现原文和译文。
 不联网、不上传、不依赖任何云端 API。
 
@@ -193,6 +196,7 @@ OpenMP 默认**忙等（spin-wait）**：线程干完活会空转一会儿等下
 
 ```bash
 # 1) 环境：JDK17 + Android SDK(35) + build-tools(35) + NDK r27
+#    （NDK 只有重新编译 native 库时才需要，脚本路径写的是 codespaces 的默认值）
 bash scripts/setup_env.sh
 
 # 2) 交叉编译第三方 native 库（arm64）→ /tmp/native-prefix/arm64
