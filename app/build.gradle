@@ -1,0 +1,97 @@
+plugins {
+    id 'com.android.application'
+}
+
+android {
+    namespace 'com.example.vtrans'
+    compileSdk 35
+
+    defaultConfig {
+        applicationId "com.example.vtrans"
+        minSdk 28
+        targetSdk 35
+        versionCode 1
+        versionName "1.0.0"
+
+        // 只做骁龙 888（arm64）这一档设备：省掉 32 位与 x86 的 so，体积减半
+        ndk {
+            abiFilters "arm64-v8a"
+        }
+        // NLLB(622MB) + SenseVoice(237MB) + Whisper(375MB) 同时驻留内存，
+        // 大堆能显著降低被 LMK 杀掉的概率
+        multiDexEnabled false
+    }
+
+    signingConfigs {
+        debug {
+            storeFile file("${System.properties['user.home']}/.android/debug.keystore")
+            storePassword "android"
+            keyAlias "androiddebugkey"
+            keyPassword "android"
+        }
+    }
+
+    buildTypes {
+        debug {
+            signingConfig signingConfigs.debug
+            minifyEnabled false
+        }
+        release {
+            minifyEnabled true
+            shrinkResources true
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'),
+                    'proguard-rules.pro'
+            // release 用 debug 签名仅为了方便 adb install 验证；
+            // 正式分发前请替换成自己的签名（见 README「发布签名」）
+            signingConfig signingConfigs.debug
+        }
+    }
+
+    // 锁死编译目标，不依赖运行 gradlew 的那个 JDK 恰好是 17
+    java {
+        toolchain {
+            languageVersion = JavaLanguageVersion.of(17)
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+
+    packagingOptions {
+        // 模型是运行时下载的，不打进 APK
+        excludes += ['META-INF/*']
+        jniLibs {
+            // 只保留 arm64，且不压缩 so（压缩会拖慢加载、增加内存）
+            excludes += ['**/x86/**', '**/x86_64/**', '**/armeabi-v7a/**']
+            useLegacyPackaging false
+        }
+    }
+
+    // 只有 Java + 资源，没有 Kotlin、没有 AIDL、没有 RenderScript
+    buildFeatures {
+        buildConfig true
+        viewBinding false
+    }
+
+    lint {
+        abortOnError true
+        checkReleaseBuilds true
+        disable 'MissingTranslation', 'ExtraTranslation'
+    }
+}
+
+dependencies {
+    // sherpa-onnx 的 Java API（纯 Kotlin 编译产物，只用它做 VAD + ASR）
+    implementation files('libs/sherpa-onnx-classes.jar')
+
+    // 解压 tar.bz2 模型包（Android 没有内置的 bzip2）
+    implementation 'org.apache.commons:commons-compress:1.27.1'
+
+    implementation 'androidx.appcompat:appcompat:1.7.0'
+    implementation 'com.google.android.material:material:1.12.0'
+    implementation 'androidx.constraintlayout:constraintlayout:2.2.0'
+    implementation 'androidx.core:core:1.15.0'
+    implementation 'androidx.preference:preference:1.2.1'
+}

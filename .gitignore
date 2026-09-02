@@ -1,0 +1,27 @@
+# Gradle / 构建产物
+.gradle/
+build/
+app/build/
+local.properties
+captures/
+.externalNativeBuild/
+.cxx/
+
+# IDE
+.idea/
+*.iml
+*.ipr
+*.iws
+out/
+
+# 系统垃圾
+.DS_Store
+Thumbs.db
+
+# 模型与第三方源码：体积大且可再生，用 tools/ 与 native/ 里的脚本重新获取
+models/
+/tmp/
+/.models/
+
+# 不要提交真机抓的日志
+*.hprof

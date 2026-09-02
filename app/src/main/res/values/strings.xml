@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">离线同传</string>
+    <string name="title_settings">设置</string>
+
+    <string name="btn_start">开始翻译</string>
+    <string name="btn_stop">结束翻译</string>
+    <string name="btn_settings">设置</string>
+
+    <string name="label_source">原文</string>
+    <string name="label_target">译文</string>
+    <string name="hint_source">识别到的原文会实时显示在这里</string>
+    <string name="hint_target">译文会逐句显示在这里</string>
+
+    <string name="status_idle">未开始</string>
+    <string name="status_loading">正在加载模型…</string>
+    <string name="status_running">正在聆听…</string>
+    <string name="status_stopped">已停止</string>
+
+    <string name="need_permission">需要麦克风权限才能翻译</string>
+    <string name="need_models">首次使用需要下载离线模型（约 %1$s）</string>
+    <string name="btn_download">下载模型</string>
+    <string name="downloading">下载中 %1$d%%（%2$s / %3$s）</string>
+    <string name="download_done">模型就绪，可以开始了</string>
+    <string name="download_failed">下载失败：%1$s</string>
+
+    <string name="settings_target_lang">目标语言</string>
+    <string name="settings_source_lang">源语言</string>
+    <string name="settings_tier">识别档位</string>
+    <string name="settings_provider">加速后端（ASR）</string>
+    <string name="settings_threads">翻译线程数</string>
+    <string name="settings_beam">解码宽度（beam）</string>
+    <string name="settings_models">模型管理</string>
+    <string name="settings_bench">跑一次基准测试</string>
+    <string name="settings_bench_hint">对比 NNAPI / XNNPACK / CPU，自动挑最快的</string>
+
+    <string name="tier_balanced">均衡（SenseVoice，增量预览）</string>
+    <string name="tier_quality">高精（Whisper，逐句定稿）</string>
+    <string name="lang_zh">中文</string>
+    <string name="lang_en">English</string>
+    <string name="lang_auto">自动检测</string>
+    <string name="provider_auto">自动（基准测试决定）</string>
+    <string name="provider_nnapi">NNAPI（NPU）</string>
+    <string name="provider_xnnpack">XNNPACK（CPU）</string>
+    <string name="provider_cpu">CPU</string>
+
+    <string name="model_ready">已就绪</string>
+    <string name="model_missing">未下载</string>
+    <string name="model_delete">删除</string>
+    <string name="model_download">下载</string>
+</resources>

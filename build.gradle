@@ -1,0 +1,9 @@
+// 顶层构建脚本：只声明插件，具体版本在 gradle/libs.versions.toml 之外用变量维护，
+// 便于 CI 与本地一致。
+plugins {
+    id 'com.android.application' version '8.7.3' apply false
+}
+
+tasks.register('clean', Delete) {
+    delete rootProject.layout.buildDirectory
+}

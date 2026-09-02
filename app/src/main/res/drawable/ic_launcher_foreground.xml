@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- 两个"对话气泡"叠在一起，示意双语互译 -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M26,32 L70,32 A6,6 0 0 1 76,38 L76,58 A6,6 0 0 1 70,64 L50,64 L40,74 L40,64 L26,64 A6,6 0 0 1 20,58 L20,38 A6,6 0 0 1 26,32 Z" />
+    <path
+        android:fillColor="#FFFFFF"
+        android:fillAlpha="0.55"
+        android:pathData="M38,44 L82,44 A6,6 0 0 1 88,50 L88,70 A6,6 0 0 1 82,76 L62,76 L52,86 L52,76 L38,76 A6,6 0 0 1 32,70 L32,50 A6,6 0 0 1 38,44 Z" />
+</vector>

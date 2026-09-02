@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string-array name="source_lang_labels">
+        <item>自动检测</item>
+        <item>中文</item>
+        <item>English</item>
+        <item>日本語</item>
+        <item>한국어</item>
+        <item>粤语</item>
+        <item>Français</item>
+        <item>Deutsch</item>
+        <item>Español</item>
+        <item>Русский</item>
+    </string-array>
+
+    <!-- 与上面的标签一一对应 -->
+    <string-array name="source_lang_values">
+        <item>auto</item>
+        <item>zh</item>
+        <item>en</item>
+        <item>ja</item>
+        <item>ko</item>
+        <item>yue</item>
+        <item>fr</item>
+        <item>de</item>
+        <item>es</item>
+        <item>ru</item>
+    </string-array>
+
+    <string-array name="provider_labels">
+        <item>自动（基准测试决定）</item>
+        <item>NNAPI（NPU）</item>
+        <item>XNNPACK（CPU 多线程）</item>
+        <item>CPU</item>
+    </string-array>
+
+    <string-array name="provider_values">
+        <item>auto</item>
+        <item>nnapi</item>
+        <item>xnnpack</item>
+        <item>cpu</item>
+    </string-array>
+
+    <string-array name="beam_labels">
+        <item>1（贪心，最快）</item>
+        <item>4（集束搜索，更准更慢）</item>
+    </string-array>
+</resources>
