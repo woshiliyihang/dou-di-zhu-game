@@ -46,8 +46,9 @@ public final class SentenceSplitter {
             lastCut = i + 1;
         }
         String rest = s.substring(lastCut);
-        if (rest.length() > MAX_LEN) {
-            // 太长：找一个逗号/空格断开，实在没有就硬切
+        // 超长（无标点或一口气说了很长）：循环找逗号/空格断开，找不到就硬切，
+        // 直到 rest 不超长——保证 flush() 收尾时绝不把整段超长文本丢给 NLLB。
+        while (rest.length() > MAX_LEN) {
             int cut = -1;
             for (int i = MAX_LEN; i < rest.length(); i++) {
                 char c = rest.charAt(i);

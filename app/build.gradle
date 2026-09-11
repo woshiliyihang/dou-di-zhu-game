@@ -56,8 +56,16 @@ android {
         targetCompatibility JavaVersion.VERSION_17
     }
 
+    // 模型随 APK 打包，且必须「不压缩」存储：
+    // 压缩过的 asset 在 open() 时会被整体解压进内存，622MB 的 model.bin 会直接 OOM；
+    // 不压缩才能用 AssetManager.openFd() 拿到长度做解包进度。
+    androidResources {
+        // 'model' / 'txt' 也一起存原样：不压缩才能用 openFd 问长度，解包进度才准
+        noCompress 'bin', 'onnx', 'model', 'txt', 'json'
+    }
+
     packagingOptions {
-        // 模型是运行时下载的，不打进 APK
+        // assets/models/ 下的模型也要进包（默认的 excludes 不会动 assets）
         excludes += ['META-INF/*']
         jniLibs {
             // 只保留 arm64，且不压缩 so（压缩会拖慢加载、增加内存）
@@ -82,9 +90,6 @@ android {
 dependencies {
     // sherpa-onnx 的 Java API（纯 Kotlin 编译产物，只用它做 VAD + ASR）
     implementation files('libs/sherpa-onnx-classes.jar')
-
-    // 解压 tar.bz2 模型包（Android 没有内置的 bzip2）
-    implementation 'org.apache.commons:commons-compress:1.27.1'
 
     implementation 'androidx.appcompat:appcompat:1.7.0'
     implementation 'com.google.android.material:material:1.12.0'

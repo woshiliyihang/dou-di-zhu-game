@@ -23,9 +23,27 @@ public final class Prefs {
     private static final String K_PARTIAL_INTERVAL = "partial_interval";
     /** 基准测试测出来的最佳 provider */
     private static final String K_BENCH_PROVIDER = "bench_provider";
+    /** 收音增益（远场增强），单位 dB：0 / 6 / 12 */
+    private static final String K_MIC_BOOST_DB = "mic_boost_db";
+    /**
+     * 语音前置处理方案：auto / system / software / off。
+     * 见 AUDIO_AUTO 等常量；改动在下次点「开始翻译」时生效。
+     */
+    private static final String K_AUDIO_MODE = "audio_mode";
+    /** 译文语音播报是否仅限耳机（默认开：避免外放被麦克风拾取形成回环） */
+    private static final String K_TTS_HEADSET_ONLY = "tts_headset_only";
 
     public static final String TIER_BALANCED = "balanced";
     public static final String TIER_QUALITY = "quality";
+
+    /** 自动：优先用系统 AEC/NS/AGC，系统缺哪项软件自动补（高通+门控+AGC） */
+    public static final String AUDIO_AUTO = "auto";
+    /** 系统链路：通话音源走手机自带 AEC/NS/AGC，缺项软件补 */
+    public static final String AUDIO_SYSTEM = "system";
+    /** 纯软件：不挂系统效果，全部用本机 DSP 算法 */
+    public static final String AUDIO_SOFTWARE = "software";
+    /** 关闭：输出原始信号 */
+    public static final String AUDIO_OFF = "off";
 
     private final SharedPreferences sp;
 
@@ -73,6 +91,32 @@ public final class Prefs {
 
     public void setBenchedProvider(String v) {
         sp.edit().putString(K_BENCH_PROVIDER, v).apply();
+    }
+
+    public String audioMode() {
+        return sp.getString(K_AUDIO_MODE, AUDIO_AUTO);
+    }
+
+    /** 收音预增益 dB：0=标准 / 6=增强 / 12=远场。远场档用于手机放远、免提、人声偏小场景。 */
+    public int micBoostDb() {
+        return sp.getInt(K_MIC_BOOST_DB, 0);
+    }
+
+    public void setMicBoostDb(int v) {
+        sp.edit().putInt(K_MIC_BOOST_DB, Math.max(0, Math.min(12, v))).apply();
+    }
+
+    /** 译文语音播报：true=仅检测到耳机时才朗读；false=是否插耳机都朗读。默认开启。 */
+    public boolean ttsHeadsetOnly() {
+        return sp.getBoolean(K_TTS_HEADSET_ONLY, true);
+    }
+
+    public void setTtsHeadsetOnly(boolean v) {
+        sp.edit().putBoolean(K_TTS_HEADSET_ONLY, v).apply();
+    }
+
+    public void setAudioMode(String v) {
+        sp.edit().putString(K_AUDIO_MODE, v).apply();
     }
 
     public int mtThreads() {

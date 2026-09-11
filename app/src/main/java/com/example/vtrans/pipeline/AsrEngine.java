@@ -43,18 +43,15 @@ public final class AsrEngine {
     public static AsrEngine create(ModelManager mm, String provider, int threads,
                                    String sourceLang) {
         OfflineRecognizer sv = null;
-        OfflineRecognizer wh = null;
-        String lang = whisperLang(sourceLang);
         if (mm.isReady(com.example.vtrans.model.ModelsManifest.SENSEVOICE)) {
             sv = buildSenseVoice(mm, provider, threads, sourceLang);
         }
-        if (mm.isReady(com.example.vtrans.model.ModelsManifest.WHISPER)) {
-            wh = buildWhisper(mm, provider, threads, lang);
+        if (sv == null) {
+            throw new IllegalStateException("没有可用的 SenseVoice 模型，请先下载/解包");
         }
-        if (sv == null && wh == null) {
-            throw new IllegalStateException("没有任何可用的 ASR 模型，请先下载");
-        }
-        return new AsrEngine(sv, wh, lang);
+        // Whisper 不在启动时强载（375MB，中文用户根本用不到）：
+        // 由 switchWhisperLang() 在第一次真的需要时按语种加载。
+        return new AsrEngine(sv, null, whisperLang(sourceLang));
     }
 
     /** 当前 Whisper 用的语种；语种不变时不会重建，避免每句话都重加载 375MB 模型 */
@@ -72,15 +69,26 @@ public final class AsrEngine {
 
     /**
      * Whisper 不接受 "auto"，语种只能显式指定。语种变了必须重建识别器
-     * （375MB 模型，重建约 1~2s），所以只在真的切换语种时才做。
+     * （375MB 模型，重建约 1~2s），所以只在真的需要时才加载/切换。
+     * 模型没解包（WHISPER 可选没装）时置空，识别方会优雅退回 SenseVoice。
      */
     public synchronized void switchWhisperLang(ModelManager mm, String provider,
                                                int threads, String detectedLang) {
         String want = whisperLang(detectedLang);
         if (whisper != null && want.equals(whisperLang)) return;
+        if (!mm.isReady(com.example.vtrans.model.ModelsManifest.WHISPER)) {
+            Log.i(TAG, "Whisper 模型未就绪，本次跳过（继续用 SenseVoice）");
+            safeRelease(whisper);
+            whisper = null;
+            whisperLang = want;
+            return;
+        }
+        Log.i(TAG, "加载 Whisper (" + want + ") …");
+        long t0 = System.currentTimeMillis();
         safeRelease(whisper);
         whisper = buildWhisper(mm, provider, threads, want);
         whisperLang = want;
+        Log.i(TAG, "Whisper (" + want + ") 加载完成，耗时 " + (System.currentTimeMillis() - t0) + "ms");
     }
 
     /** @return 识别文本；失败返回 null */
@@ -109,9 +117,12 @@ public final class AsrEngine {
     }
 
     /** SenseVoice 在 auto 模式下偶尔会带出 &lt;|zh|&gt; 这类标签，去掉再上屏 */
+    private static final java.util.regex.Pattern TAG_PATTERN =
+            java.util.regex.Pattern.compile("<\\|[^|]*\\|>");
+
     static String cleanup(String text) {
         if (text == null) return null;
-        String s = text.replaceAll("<\\|[^|]*\\|>", "").trim();
+        String s = TAG_PATTERN.matcher(text).replaceAll("").trim();
         return s.isEmpty() ? null : s;
     }
 

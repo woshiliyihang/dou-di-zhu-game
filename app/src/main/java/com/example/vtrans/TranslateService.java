@@ -21,7 +21,9 @@ import androidx.core.app.NotificationCompat;
 import androidx.core.app.ServiceCompat;
 
 import com.example.vtrans.audio.AudioCapture;
+import com.example.vtrans.audio.TtsSpeaker;
 import com.example.vtrans.model.ModelManager;
+import com.example.vtrans.model.ModelsManifest;
 import com.example.vtrans.pipeline.AsrEngine;
 import com.example.vtrans.pipeline.MtEngine;
 import com.example.vtrans.pipeline.SentenceSplitter;
@@ -29,10 +31,12 @@ import com.example.vtrans.pipeline.VadSegmenter;
 import com.example.vtrans.util.Prefs;
 import com.example.vtrans.util.Stats;
 
+import java.io.File;
 import java.util.List;
 import java.util.Locale;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -81,6 +85,7 @@ public class TranslateService extends Service {
     private VadSegmenter vad;
     private AsrEngine asr;
     private MtEngine mt;
+    private TtsSpeaker tts;
 
     private ExecutorService asrExec;
     private ExecutorService mtExec;
@@ -95,6 +100,59 @@ public class TranslateService extends Service {
     private PowerManager.WakeLock wakeLock;
     private volatile boolean running;
     private volatile String statusText = "准备中";
+
+    /** 启动(stopCapture)/停止(shutdown)同一把锁：杜绝创建与销毁交错 */
+    private final Object lifecycleLock = new Object();
+    private boolean shuttingDown;
+
+    /**
+     * 进程级运行态。前台服务可能比 MainActivity 活得久（Activity 被回收/重启），
+     * UI 重建后靠它恢复按钮与状态栏，而不是只依赖广播事件。
+     */
+    private static volatile boolean sRunning;
+
+    public static boolean isRunning() {
+        return sRunning;
+    }
+
+    /**
+     * 会话结果快照（进程级静态）。服务与 MainActivity 同进程：进程活着，服务与
+     * 快照都在；进程死了会话本来就断了。Activity 被系统回收重建后靠它把已翻译的
+     * 文本一次补回，而不是只依赖将来才到的增量广播。所有写都发生在 broadcast()，
+     * 与 Activity 的 onResult() 使用同一拼接规则，避免两处逻辑漂移。
+     */
+    private static final Object SNAP_LOCK = new Object();
+    private static final StringBuilder snapSource = new StringBuilder();
+    private static final StringBuilder snapTarget = new StringBuilder();
+    private static String snapPartial = "";
+
+    public static class SessionSnapshot {
+        public final String source;
+        public final String partial;
+        public final String target;
+
+        SessionSnapshot(String source, String partial, String target) {
+            this.source = source;
+            this.partial = partial;
+            this.target = target;
+        }
+    }
+
+    /** 供 Activity 重建时取回整段会话。 */
+    public static SessionSnapshot snapshot() {
+        synchronized (SNAP_LOCK) {
+            return new SessionSnapshot(snapSource.toString(), snapPartial, snapTarget.toString());
+        }
+    }
+
+    /** 新一轮会话开始时清空历史快照（防止上一会话内容串台）。 */
+    private static void clearSnapshot() {
+        synchronized (SNAP_LOCK) {
+            snapSource.setLength(0);
+            snapPartial = "";
+            snapTarget.setLength(0);
+        }
+    }
 
     /** PerfGuard：连续降级计数，避免每隔几句就抖一次线程数 */
     private final AtomicInteger degradeLevel = new AtomicInteger(0);
@@ -116,6 +174,8 @@ public class TranslateService extends Service {
         super.onCreate();
         prefs = new Prefs(this);
         models = new ModelManager(this);
+        // 译文语音播报：常驻初始化，是否真的出声由「仅耳机播报」开关决定
+        tts = new TtsSpeaker(this);
         createChannel();
     }
 
@@ -125,10 +185,25 @@ public class TranslateService extends Service {
             stopSelf();
             return START_NOT_STICKY;
         }
+        synchronized (lifecycleLock) {
+            if (shuttingDown) return START_NOT_STICKY; // stopSelf 已排队，拒绝重入
+        }
         if (running) return START_STICKY;
 
         running = true;
-        startAsForeground("正在加载模型…");
+        sRunning = true;
+        clearSnapshot(); // 新会话：历史文本清空，防止 UI 重建读到上一轮的残影
+        // startForeground 可能因「后台启动 FGS 被系统拒绝」「通知被用户禁用」抛异常：
+        // START_STICKY 重启（intent 为 null）、权限被拒等场景都会走到这里，不兜底会崩。
+        try {
+            startAsForeground("正在加载模型…");
+        } catch (Throwable t) {
+            Log.e(TAG, "无法进入前台（可能被系统禁止后台启动 FGS）", t);
+            running = false;
+            sRunning = false;
+            stopSelf();
+            return START_NOT_STICKY;
+        }
 
         asrExec = Executors.newSingleThreadExecutor(r -> new Thread(r, "vtrans-asr"));
         mtExec = Executors.newSingleThreadExecutor(r -> new Thread(r, "vtrans-mt"));
@@ -142,6 +217,9 @@ public class TranslateService extends Service {
     /** 加载模型 + 起录音。放在 asrExec 上串行执行，避免和识别抢线程。 */
     private void initAndRun() {
         try {
+            // shutdown() 可能先于本任务真正执行到（asrExec 是单线程，等它开始前 running 已被置 false）
+            if (!running) return;
+
             broadcastStatus("loading", "正在加载模型…");
             updateNotification("正在加载模型…");
 
@@ -155,6 +233,8 @@ public class TranslateService extends Service {
             startCapture(provider);
         } catch (Throwable t) {
             Log.e(TAG, "管线启动失败", t);
+            // 服务已进入停止流程时不必再打扰 UI
+            if (!running) return;
             broadcastStatus("error", t.getMessage());
             updateNotification("启动失败：" + t.getMessage());
             stopSelf();
@@ -165,12 +245,45 @@ public class TranslateService extends Service {
         int threads = prefs.mtThreads();
         mt = MtEngine.create(models.nllbDir().getAbsolutePath(), threads, prefs.beamForTier());
         if (mt == null) {
+            // mt_engine 的 lastError 没走 JNI 暴露，native 侧的原因看不到，
+            // 所以把模型目录打出来：少文件 / 文件不全是最常见的原因
+            Log.e(TAG, "NLLB 加载失败，目录内容：" + describeDir(models.nllbDir()));
             throw new IllegalStateException("NLLB 模型加载失败（" + models.nllbDir() + "）");
         }
         asr = AsrEngine.create(models, provider, Math.min(2, threads), prefs.sourceLang());
+
+        // 提前把 Whisper 载好：高精档、或用户明确选了非中/粤语种时这句一定会用到。
+        // auto + 均衡档的中文用户不预载 —— 375MB 模型白占内存还拖慢启动。
+        String src = prefs.sourceLang();
+        boolean eagerWhisper = Prefs.TIER_QUALITY.equals(prefs.tier())
+                || (!"auto".equals(src) && !isZhish(src));
+        if (eagerWhisper && models.isReady(ModelsManifest.WHISPER) && !asr.hasWhisper()) {
+            asr.switchWhisperLang(models, provider, Math.min(2, threads), src);
+        }
+    }
+
+    /** 列出目录里的文件与大小，排查"模型到底解包全了没有" */
+    private static String describeDir(File dir) {
+        File[] files = dir.listFiles();
+        if (files == null) return "<目录不存在或不可读>";
+        StringBuilder sb = new StringBuilder();
+        for (File f : files) {
+            if (sb.length() > 0) sb.append(", ");
+            sb.append(f.getName()).append('=').append(f.length());
+        }
+        return "[" + sb + "]";
     }
 
     private void startCapture(String provider) {
+        // 与 shutdown 共用 lifecycleLock：若服务已开始关闭，直接放弃创建，
+        // 避免 shutdown 释放完 vad/capture 后这里又 new 出来造成泄漏。
+        synchronized (lifecycleLock) {
+            if (shuttingDown) return;
+            startCaptureLocked(provider);
+        }
+    }
+
+    private void startCaptureLocked(String provider) {
         vad = new VadSegmenter(models.vadFile().getAbsolutePath(), 1, "cpu",
                 new VadSegmenter.Callback() {
                     @Override
@@ -185,7 +298,7 @@ public class TranslateService extends Service {
                     }
                 });
 
-        capture = new AudioCapture(this, new AudioCapture.Sink() {
+        capture = new AudioCapture(this, prefs.audioMode(), new AudioCapture.Sink() {
             @Override
             public void onFrame(float[] samples, int len) {
                 if (vad != null) vad.feed(samples);
@@ -199,14 +312,19 @@ public class TranslateService extends Service {
             }
         });
 
+        capture.setMicBoostDb(prefs.micBoostDb());
         acquireWakeLock();
         if (!capture.start()) {
             throw new IllegalStateException("无法启动录音");
         }
+        Log.i(TAG, "录音处理方案：" + capture.summary());
 
-        int interval = prefs.partialIntervalMs();
-        partialTimer.scheduleAtFixedRate(this::maybePartial, interval, interval,
-                TimeUnit.MILLISECONDS);
+        // 增量预览只在高精档以外才有意义；否则定时器每拍进来就 return，纯空转。
+        if (prefs.partialsEnabled()) {
+            int interval = prefs.partialIntervalMs();
+            partialTimer.scheduleAtFixedRate(this::maybePartial, interval, interval,
+                    TimeUnit.MILLISECONDS);
+        }
     }
 
     /** 增量预览：只在均衡档做，且上一轮跑完才发下一轮 */
@@ -218,30 +336,48 @@ public class TranslateService extends Service {
             partialBusy.set(false);
             return;
         }
-        asrExec.execute(() -> {
-            try {
-                String text = asr.transcribe(AsrEngine.Which.SENSEVOICE, samples);
-                if (text != null && !text.isEmpty()) {
-                    broadcast("partial", text, MtEngine.detectLang(text), 0);
+        // 捕获本地引用：submit 到 asrExec 的瞬间 shutdown 可能已把字段清掉
+        final AsrEngine engine = asr;
+        if (engine == null) {
+            partialBusy.set(false);
+            return;
+        }
+        try {
+            asrExec.execute(() -> {
+                try {
+                    // shutdown 与任务执行之间可能交错，识别要容忍 running 翻转
+                    String text = engine.transcribe(AsrEngine.Which.SENSEVOICE, samples);
+                    if (text != null && !text.isEmpty()) {
+                        broadcast("partial", text, MtEngine.detectLang(text), 0);
+                    }
+                } catch (Throwable t) {
+                    Log.w(TAG, "增量识别失败", t);
+                } finally {
+                    partialBusy.set(false);
                 }
-            } catch (Throwable t) {
-                Log.w(TAG, "增量识别失败", t);
-            } finally {
-                partialBusy.set(false);
-            }
-        });
+            });
+        } catch (Throwable t) {
+            // executor 已 shutdown / 已满等情况：放弃本轮，复位忙标志
+            partialBusy.set(false);
+        }
     }
 
     /** 一句话说完：最终识别 + 切句 + 翻译 */
     private void submitFinal(float[] samples) {
-        asrExec.execute(() -> {
-            long t0 = System.currentTimeMillis();
-            // finally 里 flush 时也要用同一个语种，"auto" 不能直接喂给 NLLB
-            String srcLang = "eng_Latn";
-            try {
+        try {
+            asrExec.execute(() -> {
+                if (!running) return; // 关闭流程已开始，不再处理旧音频段
+                // 任务执行时 shutdown 可能已把字段置空并排队了 release——
+                // 先取局部引用；本任务在 release 之前执行完，引擎仍有效。
+                AsrEngine engine = asr;
+                if (engine == null) return;
+                long t0 = System.currentTimeMillis();
+                // finally 里 flush 时也要用同一个语种，"auto" 不能直接喂给 NLLB
+                String srcLang = "eng_Latn";
+                try {
                 String srcSetting = prefs.sourceLang();
-                String text = asr.hasSenseVoice()
-                        ? asr.transcribe(AsrEngine.Which.SENSEVOICE, samples)
+                String text = engine.hasSenseVoice()
+                        ? engine.transcribe(AsrEngine.Which.SENSEVOICE, samples)
                         : null;
 
                 // SenseVoice 的 auto 语种标签不可信（实测每个语种都返回 <|yue|>），
@@ -250,14 +386,19 @@ public class TranslateService extends Service {
                 srcLang = "auto".equals(srcSetting)
                         ? (detected == null ? "eng_Latn" : detected) : srcSetting;
 
-                if (text == null && asr.hasWhisper()) {
-                    // 没有 SenseVoice 时只能靠 Whisper，此时用用户的语种设置
-                    asr.switchWhisperLang(models, providerOfAsr(), providerThreads(), srcLang);
-                    text = asr.transcribe(AsrEngine.Which.WHISPER, samples);
-                } else if (needWhisper(detected, srcSetting) && asr.hasWhisper()) {
-                    asr.switchWhisperLang(models, providerOfAsr(), providerThreads(), srcLang);
-                    String better = asr.transcribe(AsrEngine.Which.WHISPER, samples);
-                    if (better != null && !better.isEmpty()) text = better;
+                // Whisper 只在该用的时候用，且按语种懒加载（375MB 不常驻内存）。
+                boolean wantWhisper = shouldUseWhisper(detected, srcSetting)
+                        || text == null; // SenseVoice 失手时的兜底
+                if (wantWhisper && models.isReady(ModelsManifest.WHISPER)) {
+                    engine.switchWhisperLang(models, providerOfAsr(), providerThreads(), srcLang);
+                    String better = engine.transcribe(AsrEngine.Which.WHISPER, samples);
+                    if (better != null && !better.isEmpty()) {
+                        text = better;
+                        // 以 Whisper 结果为准重判一次语种（兜底路径下 SenseVoice 没输出可判）
+                        detected = MtEngine.detectLang(better);
+                        srcLang = "auto".equals(srcSetting)
+                                ? (detected == null ? "eng_Latn" : detected) : srcSetting;
+                    }
                 }
 
                 if (text == null || text.trim().isEmpty()) return;
@@ -283,7 +424,11 @@ public class TranslateService extends Service {
                     }
                 }
             }
-        });
+            });
+        } catch (Throwable t) {
+            // executor 已 shutdown：忽略排队失败
+            Log.w(TAG, "最终识别任务提交失败", t);
+        }
     }
 
     private String providerOfAsr() {
@@ -298,36 +443,57 @@ public class TranslateService extends Service {
     }
 
     /**
-     * 是否值得用 Whisper 再跑一遍：
-     * 高精档一律重跑；均衡档只在发现"不是中文"时重跑（SenseVoice 的日韩英基本不可用）。
+     * 是否值得用 Whisper 再跑一遍（模型可用性由调用方判断，这里只回答"值不值得"）：
+     * 高精档一律重跑；均衡档只在 SenseVoice 不可靠的语言上重跑。
+     * <p>注意：SenseVoice 的中文/粤语又快又准，用户显式选了中文也不该被拖慢 6~10 倍。
      */
-    private boolean needWhisper(String detected, String srcSetting) {
-        if (asr == null || !asr.hasWhisper()) return false;
-        if (detected == null) return false;
+    private boolean shouldUseWhisper(String detected, String srcSetting) {
+        if (asr == null) return false;
         if (Prefs.TIER_QUALITY.equals(prefs.tier())) return true;
-        if (!"auto".equals(srcSetting)) return true; // 用户显式指定了非 auto 语种：一律走 Whisper
+        if (!"auto".equals(srcSetting)) return !isZhish(srcSetting);
+        if (detected == null) return false;
         return !detected.startsWith("zho") && !detected.startsWith("yue");
     }
 
+    /** 中/粤（含 zh_/zho/cmn 等写法）→ 交给 SenseVoice 就够 */
+    private static boolean isZhish(String lang) {
+        String v = lang == null ? "" : lang.toLowerCase(Locale.ROOT);
+        return v.equals("zh") || v.equals("yue")
+                || v.startsWith("zh_") || v.startsWith("yue")
+                || v.startsWith("zho") || v.startsWith("cmn");
+    }
+
     private void enqueueTranslation(String sentence, String srcLang) {
-        mtExec.execute(() -> {
-            long t0 = System.currentTimeMillis();
-            String out = null;
-            try {
-                if (mt != null) {
-                    out = mt.translate(sentence, srcLang, prefs.targetLang());
+        final MtEngine engine = mt;
+        if (engine == null) return;
+        try {
+            mtExec.execute(() -> {
+                long t0 = System.currentTimeMillis();
+                String out = null;
+                try {
+                    out = engine.translate(sentence, srcLang, prefs.targetLang());
+                } catch (Throwable t) {
+                    Log.e(TAG, "翻译失败", t);
                 }
-            } catch (Throwable t) {
-                Log.e(TAG, "翻译失败", t);
-            }
-            long ms = System.currentTimeMillis() - t0;
-            mtStats.add(ms);
-            if (out != null && !out.trim().isEmpty()) {
-                broadcast("translation", out, prefs.targetLang(), ms);
-            }
-            guardPerformance();
-            updateStats();
-        });
+                long ms = System.currentTimeMillis() - t0;
+                mtStats.add(ms);
+                if (out != null && !out.trim().isEmpty()) {
+                    broadcast("translation", out, prefs.targetLang(), ms);
+                    speakTranslation(out, prefs.targetLang());
+                }
+                guardPerformance();
+                updateStats();
+            });
+        } catch (Throwable t) {
+            // executor 已 shutdown：忽略
+            Log.w(TAG, "翻译任务提交失败", t);
+        }
+    }
+
+    /** 译文语音播报；是否出声由「仅耳机播报」开关决定（见 TtsSpeaker） */
+    private void speakTranslation(String text, String targetLang) {
+        TtsSpeaker t = tts;
+        if (t != null) t.speak(text, targetLang, prefs.ttsHeadsetOnly());
     }
 
     /**
@@ -364,6 +530,19 @@ public class TranslateService extends Service {
     }
 
     private void broadcast(String kind, String text, String lang, long latencyMs) {
+        // 与 MainActivity.onResult() 同步维护镜像快照（同规则拼接）
+        synchronized (SNAP_LOCK) {
+            if ("partial".equals(kind)) {
+                snapPartial = text;
+            } else if ("final".equals(kind)) {
+                if (snapSource.length() > 0) snapSource.append('\n');
+                snapSource.append(text);
+                snapPartial = "";
+            } else if ("translation".equals(kind)) {
+                if (snapTarget.length() > 0) snapTarget.append('\n');
+                snapTarget.append(text);
+            }
+        }
         Intent i = new Intent(ACTION_RESULT)
                 .setPackage(getPackageName())
                 .putExtra(EXTRA_KIND, kind)
@@ -392,13 +571,24 @@ public class TranslateService extends Service {
         }
     }
 
+    /** 通知刷新防抖：翻译高峰时每秒可能有几条结果，逐条 notify 纯属浪费。 */
+    private final Runnable notifier = this::pushNotification;
+    private volatile String pendingText;
+
     private void updateNotification(String text) {
         statusText = text;
-        mainHandler.post(() -> {
-            NotificationManager nm =
-                    (NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE);
-            if (nm != null) nm.notify(NOTI_ID, buildNotification(text));
-        });
+        pendingText = text;
+        mainHandler.removeCallbacks(notifier);
+        mainHandler.postDelayed(notifier, 250);
+    }
+
+    private void pushNotification() {
+        // 服务可能在这 250ms 内已停止：通知已被系统移除，此时再 notify
+        // 会重新弹一条 ongoing 通知且永远停不掉，所以必须检查运行态。
+        if (pendingText == null || !running) return;
+        NotificationManager nm =
+                (NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE);
+        if (nm != null) nm.notify(NOTI_ID, buildNotification(pendingText));
     }
 
     private Notification buildNotification(String text) {
@@ -423,7 +613,6 @@ public class TranslateService extends Service {
     }
 
     private void createChannel() {
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return;
         NotificationChannel ch = new NotificationChannel(
                 CHANNEL_ID, "翻译运行中", NotificationManager.IMPORTANCE_LOW);
         ch.setDescription("翻译进行时的常驻通知");
@@ -451,21 +640,91 @@ public class TranslateService extends Service {
     }
 
     private void shutdown() {
+        synchronized (lifecycleLock) {
+            if (shuttingDown) return; // onDestroy 只来一次，但 stopSelf 可能被多线程触发
+            shuttingDown = true;
+        }
         running = false;
-        if (capture != null) capture.stop();
-        capture = null;
-        if (partialTimer != null) partialTimer.shutdownNow();
-        partialTimer = null;
-        if (asr != null) asr.release();
+
+        // 1) 停音频 → 停定时器 → 停 VAD。整段与 startCaptureLocked 共用 lifecycleLock，
+        //    保证不会出现「shutdown 先跑，startCapture 后把 vad/capture/partialTimer
+        //    建出来」的泄漏或 NPE。capture.stop() 会 join 音频线程，VAD 生产者随之退出。
+        synchronized (lifecycleLock) {
+            if (capture != null) {
+                capture.stop();
+                capture = null;
+            }
+            if (partialTimer != null) {
+                // 正在执行的那一拍可能正调 vad.isSpeaking()/snapshot()，
+                // 等它结束再 release，避免 native 竞态。
+                partialTimer.shutdownNow();
+                awaitTermination(partialTimer, 500);
+                partialTimer = null;
+            }
+            if (vad != null) {
+                vad.release();
+                vad = null;
+            }
+        }
+
+        // 3) ASR / MT 引擎释放：不在这里直接 release（可能还有任务在 native 解码）。
+        //    关键点：**立刻把字段置空、取好局部引用**，释放动作才排到各单线程队列队尾。
+        //    这样即使服务迅速重启、字段被新引擎占用，旧引擎也只被自己的释放任务释放，
+        //    不会出现「排队任务执行时读到新引擎引用而误释放」。
+        AsrEngine oldAsr = asr;
         asr = null;
-        if (vad != null) vad.release();
-        vad = null;
-        if (mt != null) mt.destroy();
+        if (asrExec != null) {
+            try {
+                asrExec.execute(() -> {
+                    if (oldAsr != null) oldAsr.release();
+                });
+            } catch (RejectedExecutionException ignored) {
+                // executor 已关闭：直接释放
+                if (oldAsr != null) oldAsr.release();
+            }
+            asrExec.shutdown();
+            asrExec = null;
+        } else if (oldAsr != null) {
+            oldAsr.release();
+        }
+
+        MtEngine oldMt = mt;
         mt = null;
-        if (asrExec != null) asrExec.shutdownNow();
-        if (mtExec != null) mtExec.shutdownNow();
+        if (mtExec != null) {
+            try {
+                mtExec.execute(() -> {
+                    if (oldMt != null) oldMt.destroy();
+                });
+            } catch (RejectedExecutionException ignored) {
+                if (oldMt != null) oldMt.destroy();
+            }
+            mtExec.shutdown();
+            mtExec = null;
+        } else if (oldMt != null) {
+            oldMt.destroy();
+        }
+
+        // 取消尚未触发的通知刷新，别让服务停了还弹一条 ongoing 通知
+        mainHandler.removeCallbacks(notifier);
+        pendingText = null;
+
+        // 停掉语音播报并释放 TTS 引擎
+        if (tts != null) {
+            tts.release();
+            tts = null;
+        }
+
         splitter.reset();
         releaseWakeLock();
+        sRunning = false;
+    }
+
+    private static void awaitTermination(java.util.concurrent.ExecutorService ex, long ms) {
+        try {
+            ex.awaitTermination(ms, java.util.concurrent.TimeUnit.MILLISECONDS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
     }
 
     @Override

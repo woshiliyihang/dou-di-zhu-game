@@ -13,7 +13,9 @@ import android.widget.TextView;
 import android.widget.Toast;
 
 import androidx.appcompat.app.AppCompatActivity;
+import androidx.appcompat.widget.SwitchCompat;
 
+import com.example.vtrans.audio.SystemAudioEffects;
 import com.example.vtrans.model.ModelManager;
 import com.example.vtrans.model.ModelsManifest;
 import com.example.vtrans.pipeline.AsrEngine;
@@ -42,6 +44,7 @@ public class SettingsActivity extends AppCompatActivity {
     private ExecutorService exec;
 
     private TextView tvThreads;
+    private TextView tvAudioDiag;
     private Button btnBench;
     private LinearLayout modelList;
 
@@ -60,6 +63,8 @@ public class SettingsActivity extends AppCompatActivity {
         RadioGroup rgTarget = findViewById(R.id.rgTarget);
         Spinner spSource = findViewById(R.id.spSource);
         RadioGroup rgTier = findViewById(R.id.rgTier);
+        RadioGroup rgAudio = findViewById(R.id.rgAudio);
+        tvAudioDiag = findViewById(R.id.tvAudioDiag);
         Spinner spProvider = findViewById(R.id.spProvider);
         Spinner spBeam = findViewById(R.id.spBeam);
         SeekBar sbThreads = findViewById(R.id.sbThreads);
@@ -87,6 +92,23 @@ public class SettingsActivity extends AppCompatActivity {
             prefs.setTier(id == R.id.rbTierQuality ? Prefs.TIER_QUALITY : Prefs.TIER_BALANCED);
             spBeam.setSelection(Prefs.TIER_QUALITY.equals(prefs.tier()) ? 1 : 0);
         });
+
+        // ---- 录音处理方案 ----
+        rgAudio.check(modeRadioId(prefs.audioMode()));
+        rgAudio.setOnCheckedChangeListener((g, id) -> {
+            String mode = audioModeOf(id);
+            prefs.setAudioMode(mode);
+            updateAudioDiag(mode);
+        });
+
+        // ---- 收音增益（远场） ----
+        RadioGroup rgMicGain = findViewById(R.id.rgMicGain);
+        rgMicGain.check(micBoostRadioId(prefs.micBoostDb()));
+        rgMicGain.setOnCheckedChangeListener((g, id) -> {
+            prefs.setMicBoostDb(micBoostDbOf(id));
+            updateAudioDiag(prefs.audioMode());
+        });
+        updateAudioDiag(prefs.audioMode());
 
         // ---- provider ----
         String[] providers = getResources().getStringArray(R.array.provider_values);
@@ -123,6 +145,11 @@ public class SettingsActivity extends AppCompatActivity {
             }
         });
 
+        // ---- 译文语音播报（仅耳机 / 任意设备） ----
+        SwitchCompat swTts = findViewById(R.id.swTtsHeadsetOnly);
+        swTts.setChecked(prefs.ttsHeadsetOnly());
+        swTts.setOnCheckedChangeListener((b, checked) -> prefs.setTtsHeadsetOnly(checked));
+
         btnBench.setOnClickListener(v -> runBenchmark());
         buildModelRows();
     }
@@ -142,6 +169,64 @@ public class SettingsActivity extends AppCompatActivity {
     private void updateThreadsLabel(int v) {
         tvThreads.setText(String.format(Locale.getDefault(),
                 "%d 线程（共 %d 核）", v, Runtime.getRuntime().availableProcessors()));
+    }
+
+    // ---------------- 录音处理（回声/降噪/增益） ----------------
+
+    private void updateAudioDiag(String mode) {
+        String hint;
+        switch (mode == null ? Prefs.AUDIO_AUTO : mode) {
+            case Prefs.AUDIO_SYSTEM:
+                hint = "通话音源走手机自带 AEC/降噪/增益（骁龙机型最可能吃到硬件链路），缺项软件自动补。";
+                break;
+            case Prefs.AUDIO_SOFTWARE:
+                hint = "不挂系统效果，全部内置算法：90Hz 高通去低频、降噪门控、自动增益、软限幅。";
+                break;
+            case Prefs.AUDIO_OFF:
+                hint = "不做任何处理，原始信号直接送识别。";
+                break;
+            case Prefs.AUDIO_AUTO:
+            default:
+                hint = "优先用系统 AEC/NS/AGC；系统缺哪项，软件就用高通+门控+AGC 补上。";
+                break;
+        }
+        String boost = boostLabel(prefs.micBoostDb());
+        tvAudioDiag.setText("设备能力： " + SystemAudioEffects.capabilityLine()
+                + "\n当前： " + hint
+                + "\n收音增益： " + boost
+                + "\n改动下次「开始翻译」生效；实际挂载见 logcat 标签 AudioCapture");
+    }
+
+    private static String boostLabel(int db) {
+        if (db >= 12) return "+12dB 远场（预抬电平，让远场人声进入 VAD/AGC 触发区间）";
+        if (db >= 6) return "+6dB 增强（1~2 米）";
+        return "0dB 标准（贴近使用）";
+    }
+
+    private static int micBoostRadioId(int db) {
+        if (db >= 12) return R.id.rbMicFar;
+        if (db >= 6) return R.id.rbMicBoost;
+        return R.id.rbMicNormal;
+    }
+
+    private static int micBoostDbOf(int radioId) {
+        if (radioId == R.id.rbMicFar) return 12;
+        if (radioId == R.id.rbMicBoost) return 6;
+        return 0;
+    }
+
+    private static int modeRadioId(String mode) {
+        if (Prefs.AUDIO_SYSTEM.equals(mode)) return R.id.rbAudioSystem;
+        if (Prefs.AUDIO_SOFTWARE.equals(mode)) return R.id.rbAudioSoftware;
+        if (Prefs.AUDIO_OFF.equals(mode)) return R.id.rbAudioOff;
+        return R.id.rbAudioAuto;
+    }
+
+    private static String audioModeOf(int radioId) {
+        if (radioId == R.id.rbAudioSystem) return Prefs.AUDIO_SYSTEM;
+        if (radioId == R.id.rbAudioSoftware) return Prefs.AUDIO_SOFTWARE;
+        if (radioId == R.id.rbAudioOff) return Prefs.AUDIO_OFF;
+        return Prefs.AUDIO_AUTO;
     }
 
     // ---------------- 模型管理 ----------------
@@ -168,13 +253,18 @@ public class SettingsActivity extends AppCompatActivity {
             Button action = new Button(this, null,
                     android.R.attr.buttonBarButtonStyle);
             action.setText(ready ? getString(R.string.model_delete)
-                    : getString(R.string.model_download));
+                    : getString(R.string.model_unpack));
             action.setOnClickListener(v -> {
+                // 服务运行中模型文件正被引擎引用（部分后端 mmap 文件），此时删除/覆盖
+                // 可能让正在识别的 native 层直接崩溃，务必先停止翻译再操作。
+                if (TranslateService.isRunning()) {
+                    Toast.makeText(this, R.string.stop_service_first, Toast.LENGTH_LONG).show();
+                    return;
+                }
                 if (models.isReady(m)) {
-                    models.delete(m);
-                    buildModelRows();
+                    confirmDelete(m, action);
                 } else {
-                    downloadOne(m, action);
+                    unpackOne(m, action);
                 }
             });
 
@@ -184,14 +274,34 @@ public class SettingsActivity extends AppCompatActivity {
         }
     }
 
-    private void downloadOne(ModelsManifest.Model m, Button action) {
+    /** 删除几百 MB 模型前二次确认，防止误删后需要重新解包。 */
+    private void confirmDelete(ModelsManifest.Model m, Button action) {
+        new androidx.appcompat.app.AlertDialog.Builder(this)
+                .setTitle(R.string.model_delete_title)
+                .setMessage(getString(R.string.model_delete_confirm, m.label))
+                .setPositiveButton(android.R.string.ok, (d, w) -> {
+                    try {
+                        models.delete(m);
+                    } catch (Exception e) {
+                        Log.e(TAG, "删除失败 " + m.id, e);
+                        Toast.makeText(this, e.getMessage(), Toast.LENGTH_LONG).show();
+                    }
+                    buildModelRows();
+                })
+                .setNegativeButton(android.R.string.cancel, null)
+                .show();
+    }
+
+    private void unpackOne(ModelsManifest.Model m, Button action) {
         action.setEnabled(false);
         exec.execute(() -> {
             try {
                 models.ensure(m, new ModelManager.Progress() {
                     @Override
                     public void onProgress(long done, long total, String stage) {
-                        runOnUiThread(() -> action.setText(stage));
+                        long pct = total <= 0 ? 0 : done * 100 / total;
+                        runOnUiThread(() ->
+                                action.setText(getString(R.string.model_unpacking, pct)));
                     }
 
                     @Override
@@ -201,7 +311,7 @@ public class SettingsActivity extends AppCompatActivity {
                 });
                 runOnUiThread(this::buildModelRows);
             } catch (Exception e) {
-                Log.e(TAG, "下载失败 " + m.id, e);
+                Log.e(TAG, "解包失败 " + m.id, e);
                 runOnUiThread(() -> {
                     Toast.makeText(this, e.getMessage(), Toast.LENGTH_LONG).show();
                     buildModelRows();

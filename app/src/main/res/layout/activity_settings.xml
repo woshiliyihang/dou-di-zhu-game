@@ -105,6 +105,99 @@
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:layout_marginTop="12dp"
+            android:text="@string/settings_audio"
+            android:textColor="@color/text_secondary"
+            android:textSize="13sp" />
+
+        <RadioGroup
+            android:id="@+id/rgAudio"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content">
+
+            <RadioButton
+                android:id="@+id/rbAudioAuto"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:checked="true"
+                android:text="@string/audio_auto"
+                android:textColor="@color/text_primary" />
+
+            <RadioButton
+                android:id="@+id/rbAudioSystem"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="@string/audio_system"
+                android:textColor="@color/text_primary" />
+
+            <RadioButton
+                android:id="@+id/rbAudioSoftware"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="@string/audio_software"
+                android:textColor="@color/text_primary" />
+
+            <RadioButton
+                android:id="@+id/rbAudioOff"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="@string/audio_off"
+                android:textColor="@color/text_primary" />
+        </RadioGroup>
+
+        <TextView
+            android:id="@+id/tvAudioDiag"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="4dp"
+            android:textColor="@color/text_secondary"
+            android:textSize="12sp" />
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="12dp"
+            android:text="@string/settings_mic_range"
+            android:textColor="@color/text_secondary"
+            android:textSize="13sp" />
+
+        <RadioGroup
+            android:id="@+id/rgMicGain"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content">
+
+            <RadioButton
+                android:id="@+id/rbMicNormal"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:checked="true"
+                android:text="@string/mic_normal"
+                android:textColor="@color/text_primary" />
+
+            <RadioButton
+                android:id="@+id/rbMicBoost"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="@string/mic_boost"
+                android:textColor="@color/text_primary" />
+
+            <RadioButton
+                android:id="@+id/rbMicFar"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="@string/mic_far"
+                android:textColor="@color/text_primary" />
+        </RadioGroup>
+
+        <View
+            android:layout_width="match_parent"
+            android:layout_height="1dp"
+            android:layout_marginTop="12dp"
+            android:background="@color/divider" />
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="12dp"
             android:text="@string/settings_provider"
             android:textColor="@color/text_secondary"
             android:textSize="13sp" />
@@ -176,6 +269,36 @@
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:entries="@array/beam_labels" />
+
+        <View
+            android:layout_width="match_parent"
+            android:layout_height="1dp"
+            android:layout_marginTop="12dp"
+            android:background="@color/divider" />
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="12dp"
+            android:text="@string/settings_tts"
+            android:textColor="@color/text_secondary"
+            android:textSize="13sp" />
+
+        <androidx.appcompat.widget.SwitchCompat
+            android:id="@+id/swTtsHeadsetOnly"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="4dp"
+            android:checked="true"
+            android:text="@string/tts_headset_only"
+            android:textColor="@color/text_primary" />
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="@string/tts_headset_hint"
+            android:textColor="@color/text_secondary"
+            android:textSize="12sp" />
 
         <View
             android:layout_width="match_parent"

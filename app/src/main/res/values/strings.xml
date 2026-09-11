@@ -18,21 +18,33 @@
     <string name="status_stopped">已停止</string>
 
     <string name="need_permission">需要麦克风权限才能翻译</string>
-    <string name="need_models">首次使用需要下载离线模型（约 %1$s）</string>
-    <string name="btn_download">下载模型</string>
-    <string name="downloading">下载中 %1$d%%（%2$s / %3$s）</string>
-    <string name="download_done">模型就绪，可以开始了</string>
-    <string name="download_failed">下载失败：%1$s</string>
+    <string name="need_models">首次使用需要把内置模型解包到手机（约 %1$s）</string>
+    <string name="models_missing_in_apk">APK 里缺少模型文件：%1$s</string>
+    <string name="unpacking">解包中 %1$d%%（%2$s / %3$s）</string>
+    <string name="unpack_done">模型就绪，可以开始了</string>
+    <string name="unpack_failed">解包失败：%1$s</string>
 
     <string name="settings_target_lang">目标语言</string>
     <string name="settings_source_lang">源语言</string>
     <string name="settings_tier">识别档位</string>
+    <string name="settings_audio">录音处理（回声/降噪/增益）</string>
+    <string name="audio_auto">自动：优先系统，缺哪项软件自动补</string>
+    <string name="audio_system">系统链路：手机自带 AEC/降噪/增益（通话音源）</string>
+    <string name="audio_software">纯软件：高通滤波 + 降噪 + 自动增益</string>
+    <string name="audio_off">关闭：原始信号</string>
+    <string name="settings_mic_range">收音增益（扩大收音范围）</string>
+    <string name="mic_normal">标准：0dB（贴近使用）</string>
+    <string name="mic_boost">增强：+6dB（1~2 米）</string>
+    <string name="mic_far">远场：+12dB（2 米外/免提，大声环境慎用）</string>
     <string name="settings_provider">加速后端（ASR）</string>
     <string name="settings_threads">翻译线程数</string>
     <string name="settings_beam">解码宽度（beam）</string>
     <string name="settings_models">模型管理</string>
     <string name="settings_bench">跑一次基准测试</string>
     <string name="settings_bench_hint">对比 NNAPI / XNNPACK / CPU，自动挑最快的</string>
+    <string name="settings_tts">译文语音播报（TTS）</string>
+    <string name="tts_headset_only">仅插入耳机时播报译文</string>
+    <string name="tts_headset_hint">开启：只有检测到有线/蓝牙耳机才朗读译文，避免外放声音被麦克风拾取、造成「翻译→外放→再识别」的回环自激。关闭：无论是否插耳机都朗读，外放时可能自激，建议安静环境下使用。</string>
 
     <string name="tier_balanced">均衡（SenseVoice，增量预览）</string>
     <string name="tier_quality">高精（Whisper，逐句定稿）</string>
@@ -45,7 +57,11 @@
     <string name="provider_cpu">CPU</string>
 
     <string name="model_ready">已就绪</string>
-    <string name="model_missing">未下载</string>
+    <string name="model_missing">未解包</string>
     <string name="model_delete">删除</string>
-    <string name="model_download">下载</string>
+    <string name="model_unpack">解包</string>
+    <string name="model_unpacking">解包 %1$d%%</string>
+    <string name="model_delete_title">删除模型</string>
+    <string name="model_delete_confirm">确定删除「%1$s」吗？删除后需重新解包才能使用。</string>
+    <string name="stop_service_first">请先停止翻译再管理模型</string>
 </resources>

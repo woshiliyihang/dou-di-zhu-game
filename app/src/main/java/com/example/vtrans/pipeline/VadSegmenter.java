@@ -133,7 +133,7 @@ public final class VadSegmenter {
         vad.reset();
     }
 
-    public void release() {
+    public synchronized void release() {
         try {
             vad.release();
         } catch (Throwable t) {

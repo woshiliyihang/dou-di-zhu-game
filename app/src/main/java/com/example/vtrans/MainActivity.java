@@ -51,15 +51,13 @@ public class MainActivity extends AppCompatActivity {
     private Button btnStop;
     private ProgressBar progress;
 
-    private Prefs prefs;
     private ModelManager models;
     private ExecutorService ioExec;
-    private final AtomicBoolean downloading = new AtomicBoolean(false);
+    private final AtomicBoolean unpacking = new AtomicBoolean(false);
 
     private final StringBuilder committedSource = new StringBuilder();
     private String partialSource = "";
     private final StringBuilder target = new StringBuilder();
-    private boolean serviceRunning;
 
     private final BroadcastReceiver receiver = new BroadcastReceiver() {
         @Override
@@ -85,7 +83,6 @@ public class MainActivity extends AppCompatActivity {
         super.onCreate(savedInstanceState);
         setContentView(R.layout.activity_main);
 
-        prefs = new Prefs(this);
         models = new ModelManager(this);
         ioExec = Executors.newSingleThreadExecutor(r -> new Thread(r, "vtrans-io"));
 
@@ -102,33 +99,57 @@ public class MainActivity extends AppCompatActivity {
         btnSettings.setOnClickListener(v ->
                 startActivity(new Intent(this, SettingsActivity.class)));
 
+        registerResultReceiver();
         refreshModelState();
     }
 
     @Override
     protected void onStart() {
         super.onStart();
-        IntentFilter f = new IntentFilter();
-        f.addAction(TranslateService.ACTION_RESULT);
-        f.addAction(TranslateService.ACTION_STATUS);
-        // 用 ContextCompat 统一注册：所有版本都显式声明 RECEIVER_NOT_EXPORTED，
-        // 避免 Android U 起对未声明 exported 的广播直接抛异常
-        androidx.core.content.ContextCompat.registerReceiver(
-                this, receiver, f, androidx.core.content.ContextCompat.RECEIVER_NOT_EXPORTED);
+        boolean serviceOn = TranslateService.isRunning();
+        // Activity 被系统回收重建时，本地三个 buffer 是空的；若服务还活着，
+        // 从进程级快照把「已翻完的历史」补回来，而不是只等以后的增量广播。
+        // 只有当本地确实没内容时才补，避免覆盖一直在前台正常累计的最新 UI。
+        if (serviceOn && committedSource.length() == 0 && target.length() == 0) {
+            TranslateService.SessionSnapshot snap = TranslateService.snapshot();
+            if (snap.source.length() > 0 || snap.target.length() > 0 || snap.partial.length() > 0) {
+                committedSource.append(snap.source);
+                partialSource = snap.partial;
+                target.append(snap.target);
+                render();
+            }
+        }
+        // 每次回前台都用当前状态刷新按钮与状态栏，避免「服务在跑但 UI 停在可点开始」。
+        setRunning(serviceOn);
+        if (serviceOn) {
+            setStatus(getString(R.string.status_running));
+        }
+    }
+
+    /**
+     * 广播注册放在 onCreate/onDestroy（而不是 onStart/onStop）：
+     * 切后台或去设置页时仍继续累计翻译结果，回前台不丢内容。
+     * 用 registerReceiver 时包 try/catch 兜底重复注册/泄漏的极端路径。
+     */
+    private void registerResultReceiver() {
+        try {
+            IntentFilter f = new IntentFilter();
+            f.addAction(TranslateService.ACTION_RESULT);
+            f.addAction(TranslateService.ACTION_STATUS);
+            androidx.core.content.ContextCompat.registerReceiver(
+                    this, receiver, f, androidx.core.content.ContextCompat.RECEIVER_NOT_EXPORTED);
+        } catch (Exception e) {
+            Log.w(TAG, "广播注册失败", e);
+        }
     }
 
     @Override
-    protected void onStop() {
+    protected void onDestroy() {
         try {
             unregisterReceiver(receiver);
         } catch (IllegalArgumentException ignored) {
             // 没注册过就算了
         }
-        super.onStop();
-    }
-
-    @Override
-    protected void onDestroy() {
         if (ioExec != null) ioExec.shutdownNow();
         super.onDestroy();
     }
@@ -139,7 +160,7 @@ public class MainActivity extends AppCompatActivity {
             return;
         }
         if (!models.allRequiredReady()) {
-            startDownload();
+            startUnpack();
             return;
         }
         startTranslate();
@@ -198,32 +219,40 @@ public class MainActivity extends AppCompatActivity {
         onStartClicked();
     }
 
-    // ---------------- 模型下载 ----------------
+    // ---------------- 模型解包（模型随 APK 打包，首次启动拷到手机） ----------------
 
     private void refreshModelState() {
         if (models.allRequiredReady()) {
             setStatus(getString(R.string.status_idle));
             return;
         }
-        String size = ModelManager.humanSize(ModelsManifest.requiredBytes());
+        List<String> lost = models.missingAssets();
+        if (!lost.isEmpty()) {
+            // 打包漏了文件：装了 APK 也没用，直接说清楚，别让人一直等进度条
+            setStatus(getString(R.string.models_missing_in_apk, lost.toString()));
+            return;
+        }
+        String size = ModelManager.humanSize(
+                models.bytesToUnpack(models.missingRequired()));
         setStatus(getString(R.string.need_models, size));
     }
 
-    private void startDownload() {
-        if (!downloading.compareAndSet(false, true)) return;
+    private void startUnpack() {
+        if (!unpacking.compareAndSet(false, true)) return;
         progress.setVisibility(View.VISIBLE);
         progress.setProgress(0);
 
         ioExec.execute(() -> {
             try {
                 List<ModelsManifest.Model> missing = models.missingRequired();
-                long total = 0;
-                for (ModelsManifest.Model m : missing) total += m.downloadBytes;
-                final long totalBytes = total;
+                final long totalBytes = models.bytesToUnpack(missing);
                 long[] done = {0};
 
                 for (ModelsManifest.Model m : missing) {
                     final long base = done[0];
+                    // 必须先算：解包完 bytesToUnpack 就变 0 了
+                    final long modelBytes = Math.max(models.bytesToUnpack(
+                            java.util.Collections.singletonList(m)), 0);
                     models.ensure(m, new ModelManager.Progress() {
                         @Override
                         public void onProgress(long partDone, long partTotal, String stage) {
@@ -232,7 +261,7 @@ public class MainActivity extends AppCompatActivity {
                                 int pct = totalBytes <= 0 ? 0
                                         : (int) (all * 100 / totalBytes);
                                 progress.setProgress(Math.min(100, Math.max(0, pct)));
-                                setStatus(getString(R.string.downloading, pct,
+                                setStatus(getString(R.string.unpacking, pct,
                                         ModelManager.humanSize(all),
                                         ModelManager.humanSize(totalBytes)));
                             });
@@ -243,26 +272,26 @@ public class MainActivity extends AppCompatActivity {
                             return isFinishing() || isDestroyed();
                         }
                     });
-                    done[0] = base + m.downloadBytes;
+                    done[0] = base + modelBytes;
                 }
                 runOnUiThread(() -> {
                     progress.setVisibility(View.GONE);
-                    setStatus(getString(R.string.download_done));
-                    downloading.set(false);
+                    setStatus(getString(R.string.unpack_done));
+                    unpacking.set(false);
                     startTranslate();
                 });
             } catch (IOException e) {
-                Log.e(TAG, "下载模型失败", e);
+                Log.e(TAG, "解包模型失败", e);
                 runOnUiThread(() -> {
                     progress.setVisibility(View.GONE);
-                    setStatus(getString(R.string.download_failed, e.getMessage()));
-                    downloading.set(false);
+                    setStatus(getString(R.string.unpack_failed, e.getMessage()));
+                    unpacking.set(false);
                 });
             } catch (Throwable t) {
-                Log.e(TAG, "下载模型异常", t);
+                Log.e(TAG, "解包模型异常", t);
                 runOnUiThread(() -> {
                     progress.setVisibility(View.GONE);
-                    downloading.set(false);
+                    unpacking.set(false);
                 });
             }
         });
@@ -295,7 +324,7 @@ public class MainActivity extends AppCompatActivity {
     /** 已定稿的原文用正常色，增量中的用灰色 */
     private void render() {
         SpannableStringBuilder sb = new SpannableStringBuilder();
-        int start = 0;
+        int start;
         sb.append(committedSource);
         start = sb.length();
         if (!partialSource.isEmpty()) {
@@ -323,7 +352,6 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private void setRunning(boolean running) {
-        serviceRunning = running;
         runOnUiThread(() -> {
             btnStart.setEnabled(!running);
             btnStop.setEnabled(running);

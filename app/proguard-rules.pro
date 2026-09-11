@@ -9,11 +9,6 @@
 }
 -keep class com.example.vtrans.pipeline.MtEngine { *; }
 
-# commons-compress 用反射找压缩器实现
--keep class org.apache.commons.compress.** { *; }
--dontwarn org.apache.commons.compress.**
--dontnote org.apache.commons.compress.**
-
 # 出错时要能看懂栈
 -keepattributes SourceFile,LineNumberTable
 -renamesourcefileattribute SourceFile
