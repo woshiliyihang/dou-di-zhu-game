@@ -28,7 +28,7 @@
     <string name="settings_source_lang">源语言</string>
     <string name="settings_tier">识别档位</string>
     <string name="settings_audio">录音处理（回声/降噪/增益）</string>
-    <string name="audio_auto">自动：优先系统，缺哪项软件自动补</string>
+    <string name="audio_auto">自动（推荐）：系统优先，缺项软件补；外放播报时自动启用回声消除</string>
     <string name="audio_system">系统链路：手机自带 AEC/降噪/增益（通话音源）</string>
     <string name="audio_software">纯软件：高通滤波 + 降噪 + 自动增益</string>
     <string name="audio_off">关闭：原始信号</string>

@@ -36,9 +36,13 @@ public final class Prefs {
     public static final String TIER_BALANCED = "balanced";
     public static final String TIER_QUALITY = "quality";
 
-    /** 自动：优先用系统 AEC/NS/AGC，系统缺哪项软件自动补（高通+门控+AGC） */
+    /**
+     * 自动（默认）：优先用系统 AEC/NS/AGC，系统缺哪项软件自动补（高通+门控+AGC）。
+     * <p>另外：关掉「仅耳机播报译文」（即会外放播报）时，自动改走通话音源，
+     * 因为硬件回声消除基本只在通话音源上生效 —— 见 TranslateService.effectiveAudioMode()。
+     */
     public static final String AUDIO_AUTO = "auto";
-    /** 系统链路：通话音源走手机自带 AEC/NS/AGC，缺项软件补 */
+    /** 系统链路：强制通话音源，走手机自带 AEC/NS/AGC，缺项软件补 */
     public static final String AUDIO_SYSTEM = "system";
     /** 纯软件：不挂系统效果，全部用本机 DSP 算法 */
     public static final String AUDIO_SOFTWARE = "software";

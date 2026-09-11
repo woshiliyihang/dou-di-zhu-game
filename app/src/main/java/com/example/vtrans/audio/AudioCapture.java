@@ -196,7 +196,8 @@ public final class AudioCapture {
                 .append(" | 软件补: HPF=开 NS=").append(softwareNs ? "开" : "关")
                 .append(" AGC=").append(softwareAgc ? "开" : "关");
         if (wantFx && !fx.aecOn) {
-            sb.append(" | AEC 系统不可用（本应用不本地外放，无回声源，影响小）");
+            sb.append(" | 系统 AEC 未能启用：外放播报译文时可能被本机麦克风拾取，建议插耳机播报"
+                    + "（或把录音处理改成「系统链路」强制通话音源）");
         }
         summary = sb.toString();
     }

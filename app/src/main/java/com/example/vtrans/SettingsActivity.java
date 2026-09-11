@@ -148,7 +148,11 @@ public class SettingsActivity extends AppCompatActivity {
         // ---- 译文语音播报（仅耳机 / 任意设备） ----
         SwitchCompat swTts = findViewById(R.id.swTtsHeadsetOnly);
         swTts.setChecked(prefs.ttsHeadsetOnly());
-        swTts.setOnCheckedChangeListener((b, checked) -> prefs.setTtsHeadsetOnly(checked));
+        swTts.setOnCheckedChangeListener((b, checked) -> {
+            prefs.setTtsHeadsetOnly(checked);
+            // 该开关会影响 auto 档的音源选择（外放播报 → 切通话音源启用硬件 AEC），刷新提示
+            updateAudioDiag(prefs.audioMode());
+        });
 
         btnBench.setOnClickListener(v -> runBenchmark());
         buildModelRows();
@@ -177,7 +181,7 @@ public class SettingsActivity extends AppCompatActivity {
         String hint;
         switch (mode == null ? Prefs.AUDIO_AUTO : mode) {
             case Prefs.AUDIO_SYSTEM:
-                hint = "通话音源走手机自带 AEC/降噪/增益（骁龙机型最可能吃到硬件链路），缺项软件自动补。";
+                hint = "强制通话音源：手机自带 AEC/降噪/增益最可能生效（骁龙机型），缺项软件自动补。";
                 break;
             case Prefs.AUDIO_SOFTWARE:
                 hint = "不挂系统效果，全部内置算法：90Hz 高通去低频、降噪门控、自动增益、软限幅。";
@@ -187,12 +191,20 @@ public class SettingsActivity extends AppCompatActivity {
                 break;
             case Prefs.AUDIO_AUTO:
             default:
-                hint = "优先用系统 AEC/NS/AGC；系统缺哪项，软件就用高通+门控+AGC 补上。";
+                hint = "识别音源 + 系统 AEC/NS/AGC，缺项用软件（高通+门控+AGC）补；"
+                        + "关掉「仅耳机播报」后会改走通话音源，让硬件回声消除生效。";
                 break;
         }
         String boost = boostLabel(prefs.micBoostDb());
+        // auto 档在「会外放播报」时自动切通话音源（硬件回声消除优先），这里把决定显式告诉用户
+        boolean autoToCall = !prefs.ttsHeadsetOnly()
+                && (mode == null || Prefs.AUDIO_AUTO.equals(mode));
         tvAudioDiag.setText("设备能力： " + SystemAudioEffects.capabilityLine()
                 + "\n当前： " + hint
+                + (autoToCall && !SystemAudioEffects.aecAvailable()
+                        ? "\n回声消除：本机不支持，外放播报可能自激，建议插耳机" : "")
+                + (autoToCall && SystemAudioEffects.aecAvailable()
+                        ? "\n回声消除：已因外放播报切到通话音源（AEC 优先）" : "")
                 + "\n收音增益： " + boost
                 + "\n改动下次「开始翻译」生效；实际挂载见 logcat 标签 AudioCapture");
     }

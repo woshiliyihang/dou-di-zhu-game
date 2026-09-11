@@ -120,7 +120,7 @@ adb install -r app/build/outputs/apk/release/app-release.apk
 | `MainActivity.java` | 主界面：开始/停止、原文与译文渲染、模型解包进度 | 广播在 `onCreate/onDestroy` 注册注销；`onStart` 从会话快照回填 |
 | `SettingsActivity.java` | 设置页：语言/档位/音频/增益/provider/线程/beam/模型管理/基准测试/**TTS 播报** | 「跑一次基准测试」同时是真机自检 |
 | `TranslateService.java` | **前台服务，整条管线的宿主** | 三个单线程池 + 定时器；会话快照；PerfGuard；通知防抖 |
-| `audio/AudioCapture.java` | `AudioRecord` 采集，16kHz 单声道，20ms 一帧 | 音源选择、系统音效挂载、软链兜底、增益与电平日志 |
+| `audio/AudioCapture.java` | `AudioRecord` 采集，16kHz 单声道，20ms 一帧 | 音源选择（外放播报时走通话音源以启用 AEC）、系统音效挂载、软件链兜底、增益与电平日志 |
 | `audio/VoicePreprocessor.java` | 软件前置处理链（高通/门控/AGC/限幅） | 因果、逐采样、零分配，不给实时链路加延迟 |
 | `audio/SystemAudioEffects.java` | 系统 AEC / NS / AGC 的挂载与能力检测 | 逐个 try/catch，失败即降级由软件补 |
 | `audio/TtsSpeaker.java` | 译文语音播报 + 耳机检测 | 是否出声由「仅耳机播报」开关决定，避免外放回环 |
@@ -236,12 +236,25 @@ MT 线程 vtrans-mt
 处理链是「系统优先、软件兜底」：
 
 ```
-AudioRecord（音源：system 档=VOICE_COMMUNICATION，其余=VOICE_RECOGNITION）
+AudioRecord（音源见下方「音源怎么选」）
    ├─ 预增益（0 / +6 / +12 dB，远场用，先抬进 VAD/AGC 触发区间）
    ├─ 系统音效（auto/system 档尝试挂载）：AEC / NS / AGC
    └─ 软件链 VoicePreprocessor（系统缺哪项就补哪项）
         90Hz 高通 → 降噪门控(挂尾 150ms) → AGC(目标 -28dBFS，最大 +18dB，只升不降) → 软限幅
 ```
+
+**音源怎么选**（由 `TranslateService.effectiveAudioMode()` 决定，改动在下次「开始翻译」生效）：
+
+| 情况 | 音源 | 理由 |
+|---|---|---|
+| 选 `system` 档 | `VOICE_COMMUNICATION` | 强制通话链路，硬件 AEC/NS/AGC 最可能生效 |
+| `auto` 档 + 已关闭「仅耳机播报」 | `VOICE_COMMUNICATION` | 会出现外放播报的回声源，切通话源让硬件 AEC 生效 |
+| `auto` 档 + 仅耳机播报（默认） | `VOICE_RECOGNITION` | 扬声器不发声、没有回声源，识别音源信号更干净 |
+| `software` / `off` 档 | `VOICE_RECOGNITION` | 不依赖系统链路，交给软件链或原样输出 |
+
+> 关键前提：系统 `AcousticEchoCanceler` 在识别音源上多数 ROM 会直接禁用（挂载返回 false 或抛异常），
+> 所以「想吃到硬件回声消除」的前提就是走通话音源。设置页会显示本机是否支持 AEC，
+> 以及当前是否因外放播报切到了通话音源。
 
 - 门控与 AGC 的阈值都基于**自适应噪声底**：安静环境不放大底噪，停顿期压低，不误杀大声语音
 - 每 250 帧（约 5 秒）打一条输入/输出电平与 AGC 增益日志（tag `AudioCapture`），判断增益是否异常就看它
@@ -334,6 +347,14 @@ target_prefix = [[tgt_lang]]
 - **初始化竞态**：TTS 引擎初始化要几百毫秒，这期间来的译文会暂存一句，`onInit` 后补播
 - 服务停止时 `release()`：停止朗读并释放引擎
 - `AndroidManifest.xml` 里声明了 `<queries><intent><action ...TTS_SERVICE/></intent></queries>`，否则 Android 11+ 的包可见性限制可能让 `TextToSpeech` 查不到系统引擎
+
+**外放播报时怎么防回环**：软件前处理链里没有 AEC（回声消除必须拿到播放参考信号，
+纯前处理做不到），所以只能依赖系统 AEC。而系统 AEC 只在通话音源上才可能生效，
+因此 `auto` 档在「仅插入耳机时播报译文」被关闭（即允许外放）时，会自动把音源切成
+`VOICE_COMMUNICATION`（见 6.3 的音源表）。默认的仅耳机播报场景扬声器不发声、
+没有回声源，所以保持识别音源，不让通话链路的通信优化影响识别质量。
+
+设置页的录音处理提示会把当前决定显示出来：本机是否支持 AEC、是否已因外放播报切到通话音源。
 
 ### 6.8 结果广播与 UI 渲染
 
@@ -459,7 +480,7 @@ APK: assets/models/...                     ← noCompress，可用 openFd 问长
 | 很久都不出译文 | 正常行为：要等停顿 ≥0.35s 或说满 20s 才定稿，见 6.4 |
 | 翻译极慢（>10s/句） | 先看基准测试结果；确认 PerfGuard 是否已降级；`dumpsys meminfo` 看是否被杀 |
 | 不播报译文 | 检查「仅插入耳机时播报译文」是否开着而当前没插耳机（插蓝牙耳机也算）；logcat 搜 `TtsSpeaker` 看是「未检测到耳机，跳过播报」还是 TTS 初始化失败 |
-| 播报有回声/自己翻译自己 | 关掉「仅插入耳机时播报译文」后外放导致的回环，改回插耳机 |
+| 播报有回声 / 自己翻译自己 | 外放播报的回环。`auto` 档会在关闭「仅耳机播报」时自动切到通话音源以启用硬件 AEC；若设置页显示「本机不支持 AEC」，只能插耳机播报，或接受回环风险 |
 | 识别效果差 | 检查录音处理方案与收音增益（logcat 看 `AudioCapture` 的挂载与电平日志）；安静环境先试 `system` 或 `software` 档 |
 | 改了 C++ 没生效 | 必须重跑 `native/build_vtrans_android.sh`（Gradle 不会自动编 `app/src/main/cpp`） |
 

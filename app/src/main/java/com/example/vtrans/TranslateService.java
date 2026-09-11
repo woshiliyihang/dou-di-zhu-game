@@ -298,7 +298,7 @@ public class TranslateService extends Service {
                     }
                 });
 
-        capture = new AudioCapture(this, prefs.audioMode(), new AudioCapture.Sink() {
+        capture = new AudioCapture(this, effectiveAudioMode(), new AudioCapture.Sink() {
             @Override
             public void onFrame(float[] samples, int len) {
                 if (vad != null) vad.feed(samples);
@@ -325,6 +325,25 @@ public class TranslateService extends Service {
             partialTimer.scheduleAtFixedRate(this::maybePartial, interval, interval,
                     TimeUnit.MILLISECONDS);
         }
+    }
+
+    /**
+     * 实际使用的录音处理方案。
+     *
+     * <p><b>硬件回声消除优先</b>：系统 {@link android.media.audiofx.AcousticEchoCanceler}
+     * 基本只在通话音源（VOICE_COMMUNICATION）上才会被 ROM 真正启用，这是压制
+     * 「TTS 外放播报 → 被本机麦克风拾取 → 再识别再翻译」回环的关键。
+     *
+     * <p>但通话音源会带上一整套通信优化（可能是窄带/强压缩），对远场识别不友好，
+     * 所以只在真的存在外放回声源时才切过去：即用户关掉了「仅插入耳机时播报译文」。
+     * 默认（仅耳机播报）扬声器不发声，没有回声源，继续用识别音源，识别质量不受影响。
+     */
+    private String effectiveAudioMode() {
+        String mode = prefs.audioMode();
+        if (Prefs.AUDIO_AUTO.equals(mode) && !prefs.ttsHeadsetOnly()) {
+            return Prefs.AUDIO_SYSTEM;
+        }
+        return mode;
     }
 
     /** 增量预览：只在均衡档做，且上一轮跑完才发下一轮 */
