@@ -44,12 +44,23 @@ public class MainActivity extends AppCompatActivity {
     private static final String TAG = "MainActivity";
     private static final int REQ_PERM = 100;
 
+    /** 电平条只做可视反馈，-60dBFS 当作底、0dBFS 当满格 */
+    private static final double LEVEL_FLOOR_DB = -60.0;
+    /** 低于这个峰值基本就是「没收到有效人声」，连续 QUIET_TICKS 拍才提示，避免咳嗽一声就弹字 */
+    private static final double QUIET_DB = -38.0;
+    /** 电平广播约 240ms 一次，8 拍 ≈ 2 秒 */
+    private static final int QUIET_TICKS = 8;
+
     private TextView tvStatus;
     private TextView tvSource;
     private TextView tvTarget;
     private Button btnStart;
     private Button btnStop;
     private ProgressBar progress;
+    private ProgressBar levelBar;
+    private TextView tvLevelHint;
+    private int quietTicks = 0;
+    private boolean runningUi = false;
 
     private ModelManager models;
     private ExecutorService ioExec;
@@ -74,6 +85,9 @@ public class MainActivity extends AppCompatActivity {
                 if ("error".equals(state)) {
                     setRunning(false);
                 }
+            } else if (TranslateService.ACTION_LEVEL.equals(intent.getAction())) {
+                // 未注册 STOP 之外的生命周期，收到电平就说明还在跑
+                onLevel(intent.getFloatExtra(TranslateService.EXTRA_DBFS, -120f));
             }
         }
     };
@@ -92,6 +106,8 @@ public class MainActivity extends AppCompatActivity {
         btnStart = findViewById(R.id.btnStart);
         btnStop = findViewById(R.id.btnStop);
         progress = findViewById(R.id.progress);
+        levelBar = findViewById(R.id.levelBar);
+        tvLevelHint = findViewById(R.id.tvLevelHint);
         Button btnSettings = findViewById(R.id.btnSettings);
 
         btnStart.setOnClickListener(v -> onStartClicked());
@@ -136,6 +152,7 @@ public class MainActivity extends AppCompatActivity {
             IntentFilter f = new IntentFilter();
             f.addAction(TranslateService.ACTION_RESULT);
             f.addAction(TranslateService.ACTION_STATUS);
+            f.addAction(TranslateService.ACTION_LEVEL);
             androidx.core.content.ContextCompat.registerReceiver(
                     this, receiver, f, androidx.core.content.ContextCompat.RECEIVER_NOT_EXPORTED);
         } catch (Exception e) {
@@ -309,10 +326,15 @@ public class MainActivity extends AppCompatActivity {
                 if (committedSource.length() > 0) committedSource.append('\n');
                 committedSource.append(text);
                 partialSource = "";
+                // 已经收到话了，再提「声音太小」就是干扰
+                quietTicks = 0;
+                showLevelHint(false);
                 break;
             case "translation":
                 if (target.length() > 0) target.append('\n');
                 target.append(text);
+                quietTicks = 0;
+                showLevelHint(false);
                 setStatus(getString(R.string.status_running) + " · " + latencyMs + "ms");
                 break;
             default:
@@ -351,10 +373,43 @@ public class MainActivity extends AppCompatActivity {
         runOnUiThread(() -> tvStatus.setText(s));
     }
 
+    /**
+     * 收音电平刷新。服务里每个采样窗口（≈240ms）广播一次，
+     * 无 handler 注册的广播本来就投主线程，直接改控件即可。
+     * 关键是把「没收到声」和「收到声但认不出」分开：前者提示靠麦克风，
+     * 后者才是算法问题，不能靠这个条子区分，所以只在持续过小时提一次醒。
+     */
+    private void onLevel(float dbfs) {
+        if (!runningUi || levelBar == null) return;
+        double db = Float.isNaN(dbfs) ? -120.0 : dbfs;
+        int pct = (int) Math.round((db - LEVEL_FLOOR_DB) * 100.0 / -LEVEL_FLOOR_DB);
+        levelBar.setProgress(Math.min(100, Math.max(0, pct)));
+        if (db < QUIET_DB) {
+            if (++quietTicks >= QUIET_TICKS) showLevelHint(true);
+        } else {
+            quietTicks = 0;
+        }
+    }
+
+    private void showLevelHint(boolean show) {
+        if (tvLevelHint != null) {
+            tvLevelHint.setVisibility(show ? View.VISIBLE : View.GONE);
+        }
+    }
+
     private void setRunning(boolean running) {
         runOnUiThread(() -> {
             btnStart.setEnabled(!running);
             btnStop.setEnabled(running);
+            runningUi = running;
+            if (levelBar != null) {
+                levelBar.setVisibility(running ? View.VISIBLE : View.GONE);
+                if (!running) levelBar.setProgress(0);
+            }
+            if (!running) {
+                quietTicks = 0;
+                showLevelHint(false);
+            }
         });
     }
 }

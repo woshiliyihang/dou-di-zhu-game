@@ -30,8 +30,11 @@ import com.example.vtrans.pipeline.SentenceSplitter;
 import com.example.vtrans.pipeline.VadSegmenter;
 import com.example.vtrans.util.Prefs;
 import com.example.vtrans.util.Stats;
+import com.example.vtrans.util.WaveReader;
 
 import java.io.File;
+import java.util.ArrayDeque;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Locale;
 import java.util.concurrent.ExecutorService;
@@ -72,6 +75,11 @@ public class TranslateService extends Service {
     public static final String EXTRA_STATE = "state";     // loading / running / error
     public static final String EXTRA_MESSAGE = "message";
 
+    /** 广播：实时电平（约 240ms 一次），给主界面电平条与「声音太小」提示用 */
+    public static final String ACTION_LEVEL = "com.example.vtrans.LEVEL";
+    public static final String EXTRA_DBFS = "dbfs";         // 送识别那一路的峰值
+    public static final String EXTRA_AGC_DB = "agc_db";     // 当前软件 AGC 增益
+
     private static final int NOTI_ID = 1001;
     private static final String CHANNEL_ID = "vtrans_running";
 
@@ -93,9 +101,34 @@ public class TranslateService extends Service {
     private final AtomicBoolean partialBusy = new AtomicBoolean(false);
     private final AtomicInteger seq = new AtomicInteger(0);
 
+    /**
+     * 定稿优先：&gt;0 表示有定稿段正在识别或在 asrExec 上排队。增量预览和定稿共用
+     * 同一条识别队列，而预览只是灰色底稿——说完话的那一刻必须让路给定稿，否则越到
+     * 长句尾拍预览越慢，用户就会感到「明明说完了却还在转圈」。
+     */
+    private final AtomicInteger finalQueued = new AtomicInteger(0);
+
+    /** 碎句攒着等拼接的兜底：距上一段太近且尾巴太短就先不翻（见 maybeFlushTail） */
+    private static final int TAIL_KEEP_MIN_CHARS = 6;
+    /** 攒着的碎句最多等多久，到点必须吐出去，免得用户不说了译文就永远不来 */
+    private static final long TAIL_FLUSH_DELAY_MS = 1200;
+    private volatile long lastSegmentAtMs;
+    private volatile String lastSegLang;
+
     private final SentenceSplitter splitter = new SentenceSplitter();
     private final Stats asrStats = new Stats(8);
     private final Stats mtStats = new Stats(8);
+
+    /**
+     * 引擎还在加载时抵达的语音段。点「开始翻译」到 NLLB/SenseVoice 装好有 1~5 秒，
+     * 而用户往往就在这段时间开口 —— 所以先开录音、把这段里的段攒着，引擎就绪后按序补跑。
+     * 只在录音线程写入、asrExec 读取/排空，统一用 {@code pendingLock}。
+     */
+    private static final int MAX_PENDING_SEGMENTS = 6;
+    private final Object pendingLock = new Object();
+    private final ArrayDeque<float[]> pendingSegments = new ArrayDeque<>();
+    /** 引擎就绪且 warmup 完成才置真；此前提交的段一律入队而不是丢弃 */
+    private volatile boolean enginesReady;
 
     private PowerManager.WakeLock wakeLock;
     private volatile boolean running;
@@ -157,6 +190,13 @@ public class TranslateService extends Service {
     /** PerfGuard：连续降级计数，避免每隔几句就抖一次线程数 */
     private final AtomicInteger degradeLevel = new AtomicInteger(0);
     private long latencyBaselineMs = 0;
+    /** 翻译线程数的下限：1 线程翻 600M 每句要好几秒，那不是省电那是卡 */
+    private static final int MIN_MT_THREADS = 2;
+    /** 绝对门槛：慢到用户能感觉到才降级，别拿「比冷机头几句慢」当理由 */
+    private static final long DEGRADE_FLOOR_MS = 900;
+    /** 连续这么多句明显快于基线，就把降掉的档位升回去 */
+    private static final int RECOVER_STREAK = 5;
+    private int fastStreak;
 
     public class LocalBinder extends Binder {
         public TranslateService getService() {
@@ -193,6 +233,14 @@ public class TranslateService extends Service {
         running = true;
         sRunning = true;
         clearSnapshot(); // 新会话：历史文本清空，防止 UI 重建读到上一轮的残影
+        // 新会话重新建基线：上一轮的降级档位和延迟基线留给这一轮没有任何意义
+        // （引擎是新的，机器温度也是新的），否则会出现「上次热过、这次一上来就是低档」。
+        degradeLevel.set(0);
+        latencyBaselineMs = 0;
+        fastStreak = 0;
+        asrStats.reset();
+        mtStats.reset();
+        splitter.reset();
         // startForeground 可能因「后台启动 FGS 被系统拒绝」「通知被用户禁用」抛异常：
         // START_STICKY 重启（intent 为 null）、权限被拒等场景都会走到这里，不兜底会崩。
         try {
@@ -214,23 +262,35 @@ public class TranslateService extends Service {
         return START_STICKY;
     }
 
-    /** 加载模型 + 起录音。放在 asrExec 上串行执行，避免和识别抢线程。 */
+    /**
+     * 起录音 + 加载模型。
+     *
+     * <p><b>顺序很关键</b>：先建 VAD（只有 208KB，几十毫秒）并把麦克风升起来，
+     * 再慢慢装 NLLB(622MB) / SenseVoice(237MB)。老顺序是先装模型再开录音，
+     * 中间那 1~5 秒里根本没在采集，用户点完按钮本能就开口，第一句整段丢失。
+     * 现在这段时间里的语音段进了 {@link #pendingSegments}，引擎就绪后按序补跑。
+     */
     private void initAndRun() {
         try {
             // shutdown() 可能先于本任务真正执行到（asrExec 是单线程，等它开始前 running 已被置 false）
             if (!running) return;
 
-            broadcastStatus("loading", "正在加载模型…");
-            updateNotification("正在加载模型…");
-
             String provider = providerOfAsr();
+
+            broadcastStatus("loading", "正在聆听（模型后台加载中）…");
+            updateNotification("模型加载中…");
+            startCapture(provider);
+
+            if (!running) return;
             loadEngines(provider);
 
             if (!running) return;
+            warmUpEngines();
+            enginesReady = true;
+            drainPendingSegments();
 
             broadcastStatus("running", "已开始（provider=" + provider + "）");
             updateNotification("正在聆听…");
-            startCapture(provider);
         } catch (Throwable t) {
             Log.e(TAG, "管线启动失败", t);
             // 服务已进入停止流程时不必再打扰 UI
@@ -239,6 +299,69 @@ public class TranslateService extends Service {
             updateNotification("启动失败：" + t.getMessage());
             stopSelf();
         }
+    }
+
+    /**
+     * 首次推理预热：ONNX session 第一次 run 要图优化 + 分配内存，实测比后续慢很多倍，
+     * 不预热的话「第一句」明显最慢、也最容易掉字。拿随包的 bench_zh.wav 跑一遍，结果丢掉。
+     * <p>跑在 asrExec 上（就是它自己），不占录音线程；MT 预热排到 mtExec 队尾，
+     * 不阻塞后面的真活。失败只记日志，绝不影响启动。
+     */
+    private void warmUpEngines() {
+        long t0 = System.currentTimeMillis();
+        try {
+            float[] wav = WaveReader.read(this, "bench_zh.wav");
+            // 取前 2 秒就够：目的是走一遍图，不是验质量
+            int n = Math.min(wav.length, 2 * VadSegmenter.SAMPLE_RATE);
+            if (n < VadSegmenter.SAMPLE_RATE / 2) return;
+            float[] probe = Arrays.copyOfRange(wav, 0, n);
+            AsrEngine a = asr;
+            if (a != null && a.hasSenseVoice()) {
+                a.transcribe(AsrEngine.Which.SENSEVOICE, probe);
+            }
+        } catch (Throwable t) {
+            Log.i(TAG, "ASR 预热跳过（不影响使用）: " + t.getMessage());
+        }
+        final MtEngine m = mt;
+        if (m != null) {
+            try {
+                mtExec.execute(() -> {
+                    try {
+                        m.translate("你好。", "zho_Hans", prefs.targetLang());
+                    } catch (Throwable ignored) {
+                        // 预热失败无所谓
+                    }
+                });
+            } catch (Throwable ignored) {
+                // mtExec 已关闭，服务在停
+            }
+        }
+        Log.i(TAG, "引擎预热完成，耗时 " + (System.currentTimeMillis() - t0) + "ms");
+    }
+
+    /** 把模型加载期间攒下的段按原顺序交给识别，保证上屏顺序与实际说话顺序一致。 */
+    private void drainPendingSegments() {
+        float[] seg;
+        while ((seg = pollPending()) != null) {
+            submitFinal(seg);
+        }
+    }
+
+    private float[] pollPending() {
+        synchronized (pendingLock) {
+            return pendingSegments.pollFirst();
+        }
+    }
+
+    private void holdPendingSegment(float[] samples) {
+        synchronized (pendingLock) {
+            // 引擎迟迟装不好时不能无限攒（一段最长 20s 音频），丢最早的，保最近的
+            if (pendingSegments.size() >= MAX_PENDING_SEGMENTS) {
+                pendingSegments.pollFirst();
+            }
+            pendingSegments.addLast(samples);
+        }
+        Log.i(TAG, "模型仍在加载，本段音频已排队等待识别");
     }
 
     private void loadEngines(String provider) {
@@ -300,8 +423,14 @@ public class TranslateService extends Service {
 
         capture = new AudioCapture(this, effectiveAudioMode(), new AudioCapture.Sink() {
             @Override
-            public void onFrame(float[] samples, int len) {
-                if (vad != null) vad.feed(samples);
+            public void onFrame(float[] vadFrame, float[] asrFrame, int len) {
+                // 门控路只喂 VAD，无门控路进识别缓冲 —— 两者在 VadSegmenter 里分流
+                if (vad != null) vad.feed(vadFrame, asrFrame);
+            }
+
+            @Override
+            public void onLevel(double outDbfs, double agcDb) {
+                broadcastLevel(outDbfs, agcDb);
             }
 
             @Override
@@ -313,6 +442,7 @@ public class TranslateService extends Service {
         });
 
         capture.setMicBoostDb(prefs.micBoostDb());
+        capture.setCaptureRateHz(prefs.captureRateHz());
         acquireWakeLock();
         if (!capture.start()) {
             throw new IllegalStateException("无法启动录音");
@@ -349,9 +479,14 @@ public class TranslateService extends Service {
     /** 增量预览：只在均衡档做，且上一轮跑完才发下一轮 */
     private void maybePartial() {
         if (!running || !prefs.partialsEnabled() || vad == null) return;
+        // 模型还没装好就别抢 asrExec（那段时间在排队的是攒下来的真音频）
+        if (!enginesReady) return;
+        // 有定稿在跑或排队：这一拍预览直接跳过。预览晚一拍没人看得出，
+        // 定稿晚一拍就是「说完话干等」。
+        if (finalQueued.get() > 0) return;
         if (!vad.isSpeaking() || !partialBusy.compareAndSet(false, true)) return;
         float[] samples = vad.snapshot();
-        if (samples == null || samples.length < 8000) { // 短于 0.5s 没什么可认的
+        if (samples == null) { // 短于 VadSegmenter 的最小可认长度（含前缀）就没什么可认的
             partialBusy.set(false);
             return;
         }
@@ -383,21 +518,41 @@ public class TranslateService extends Service {
 
     /** 一句话说完：最终识别 + 切句 + 翻译 */
     private void submitFinal(float[] samples) {
+        // 模型还在加载：攒起来，等 drainPendingSegments() 按序补跑，而不是把这句话丢掉
+        if (!enginesReady) {
+            holdPendingSegment(samples);
+            return;
+        }
+        // 判停时刻：用来算「排了多久队」，这是说完话之后最先吃掉的隐形时间
+        final long cutAt = System.currentTimeMillis();
+        lastSegmentAtMs = cutAt;
+        // 新一段来了，先前攒着的碎句由这一段一起处理，兜底任务不用再跑
+        mainHandler.removeCallbacks(tailFlushGuard);
+        finalQueued.incrementAndGet();
         try {
             asrExec.execute(() -> {
-                if (!running) return; // 关闭流程已开始，不再处理旧音频段
+                if (!running) { finalQueued.decrementAndGet(); return; } // 关闭流程已开始
                 // 任务执行时 shutdown 可能已把字段置空并排队了 release——
                 // 先取局部引用；本任务在 release 之前执行完，引擎仍有效。
                 AsrEngine engine = asr;
-                if (engine == null) return;
+                if (engine == null) { finalQueued.decrementAndGet(); return; }
                 long t0 = System.currentTimeMillis();
-                // finally 里 flush 时也要用同一个语种，"auto" 不能直接喂给 NLLB
-                String srcLang = "eng_Latn";
+                long queueMs = t0 - cutAt;
+                // finally 里 flush 时也要用同一个语种，"auto" 不能直接喂给 NLLB。
+                // 初值一定要是 null：没判出语种就干脆不翻，别让还没赋过值的
+                // 中文句子被当成英文送进去，输出看起来像“识别错了”。
+                String srcLang = null;
+                long svMs = 0;
+                long whMs = 0;
                 try {
                 String srcSetting = prefs.sourceLang();
+                // 归一化前的峰值：transcribe() 会原地改 samples，事后再量就不准了
+                final float segPeak = peakOf(samples);
+                long tSv0 = System.currentTimeMillis();
                 String text = engine.hasSenseVoice()
                         ? engine.transcribe(AsrEngine.Which.SENSEVOICE, samples)
                         : null;
+                svMs = System.currentTimeMillis() - tSv0;
 
                 // SenseVoice 的 auto 语种标签不可信（实测每个语种都返回 <|yue|>），
                 // 所以语种一律按"识别出来的文字用了哪种书写系统"来定。
@@ -406,11 +561,22 @@ public class TranslateService extends Service {
                         ? (detected == null ? "eng_Latn" : detected) : srcSetting;
 
                 // Whisper 只在该用的时候用，且按语种懒加载（375MB 不常驻内存）。
+                // looksMissed：整段够长（≥1.2s，段首尾静音已被 VadSegmenter 裁掉）
+                // 却几乎没出字，这种时候值得花 6~10 倍时间用 Whisper 重跑一次
+                // （Whisper 对低电平更宽容）。
+                // segPeak 那道门不能省：Whisper 有个出名的毛病——给它接近静音的音频，
+                // 它会凭空编出一句话来，宁可少说也别上屏假字。
+                boolean looksMissed = samples.length >= (long) (1.2 * VadSegmenter.SAMPLE_RATE)
+                        && segPeak > MISSED_MIN_PEAK
+                        && (text == null || text.trim().length() <= 2);
                 boolean wantWhisper = shouldUseWhisper(detected, srcSetting)
-                        || text == null; // SenseVoice 失手时的兜底
+                        || text == null      // SenseVoice 失手时的兜底
+                        || looksMissed;      // 轻声/远场没认出来
                 if (wantWhisper && models.isReady(ModelsManifest.WHISPER)) {
+                    long tWh0 = System.currentTimeMillis();
                     engine.switchWhisperLang(models, providerOfAsr(), providerThreads(), srcLang);
                     String better = engine.transcribe(AsrEngine.Which.WHISPER, samples);
+                    whMs = System.currentTimeMillis() - tWh0;
                     if (better != null && !better.isEmpty()) {
                         text = better;
                         // 以 Whisper 结果为准重判一次语种（兜底路径下 SenseVoice 没输出可判）
@@ -424,6 +590,11 @@ public class TranslateService extends Service {
 
                 long asrMs = System.currentTimeMillis() - t0;
                 asrStats.add(asrMs);
+                // 逐句链路日志：延迟到底卡在排队、SenseVoice、Whisper 还是翻译，一眼能看出来
+                Log.i(TAG, String.format(Locale.ROOT,
+                                "定稿: 音频%.2fs 排队%dms SenseVoice%dms Whisper%dms",
+                                samples.length / (float) VadSegmenter.SAMPLE_RATE,
+                                queueMs, svMs, whMs));
                 broadcast("final", text, srcLang, asrMs);
 
                 List<String> sentences = splitter.push(text);
@@ -435,19 +606,69 @@ public class TranslateService extends Service {
             } catch (Throwable t) {
                 Log.e(TAG, "最终识别失败", t);
             } finally {
-                // VAD 可能把停顿当成句内停顿，这里补一次 flush 保证不漏字
-                List<String> rest = splitter.flush();
-                if (rest != null) {
-                    for (String s : rest) {
-                        enqueueTranslation(s, srcLang);
+                finalQueued.decrementAndGet();
+                // VAD 现在 0.32s 就判停，句间停顿很可能被切成两段。这里的策略：
+                // 残留够长（≥6 字）就马上翻，用户在等；太短（"那个"、"就是"这种）
+                // 先攒着，下一段来了拼成整句再翻——但最多攒 1.2s，到点必须吐出去。
+                if (srcLang != null) {
+                    lastSegLang = srcLang;
+                    int tail = splitter.pendingLength();
+                    if (tail >= TAIL_KEEP_MIN_CHARS) {
+                        flushSplitter(srcLang);
+                    } else if (tail > 0) {
+                        mainHandler.postDelayed(tailFlushGuard, TAIL_FLUSH_DELAY_MS);
                     }
                 }
             }
             });
         } catch (Throwable t) {
             // executor 已 shutdown：忽略排队失败
+            finalQueued.decrementAndGet();
             Log.w(TAG, "最终识别任务提交失败", t);
         }
+    }
+
+    /** 攒着的碎句兜底：到点还没被下一段接走就强制吐给 MT，保证译文一定会出现 */
+    private final Runnable tailFlushGuard = this::maybeFlushTail;
+
+    private void maybeFlushTail() {
+        if (!running || splitter.pendingLength() == 0) return;
+        // 这一会儿又有新段进来了（新段自己会重新安排兜底），再等一小轮
+        if (System.currentTimeMillis() - lastSegmentAtMs < TAIL_FLUSH_DELAY_MS - 300) {
+            mainHandler.postDelayed(tailFlushGuard, 300);
+            return;
+        }
+        String lang = lastSegLang;
+        if (lang == null) return;
+        try {
+            // 与识别、切句同一线程执行，避免 push() 和 flush() 并发操作 splitter
+            asrExec.execute(() -> flushSplitter(lang));
+        } catch (Throwable ignored) {
+            // executor 已关闭：服务在停，残句不用管
+        }
+    }
+
+    /** 把切句器里攒下的残句全部送去翻译（识别线程调用） */
+    private void flushSplitter(String lang) {
+        List<String> rest = splitter.flush();
+        if (rest != null) {
+            for (String s : rest) {
+                enqueueTranslation(s, lang);
+            }
+        }
+    }
+
+    /** 低于这个峰值（≈ -40dBFS）的定稿段当作“基本只有底噪”，不值得花 Whisper 重跑 */
+    private static final float MISSED_MIN_PEAK = 0.01f;
+
+    private static float peakOf(float[] x) {
+        if (x == null) return 0f;
+        float peak = 0f;
+        for (float v : x) {
+            float a = Math.abs(v);
+            if (a > peak) peak = a;
+        }
+        return peak;
     }
 
     private String providerOfAsr() {
@@ -496,6 +717,10 @@ public class TranslateService extends Service {
                 }
                 long ms = System.currentTimeMillis() - t0;
                 mtStats.add(ms);
+                // 翻译这一环的耗时（含排队）单独记一条：它和识别是分开的两个线程
+                Log.i(TAG, String.format(Locale.ROOT, "译文: %dms %d字 level=%d ← %s",
+                        ms, sentence.length(), degradeLevel.get(),
+                        sentence.length() > 18 ? sentence.substring(0, 18) + "…" : sentence));
                 if (out != null && !out.trim().isEmpty()) {
                     broadcast("translation", out, prefs.targetLang(), ms);
                     speakTranslation(out, prefs.targetLang());
@@ -516,27 +741,57 @@ public class TranslateService extends Service {
     }
 
     /**
-     * PerfGuard：骁龙 888 发热降频很凶。用前若干句的延迟建立基线，
-     * 之后若滚动均值持续超过基线 2.5 倍，就逐级降线程/降 beam。
+     * PerfGuard：骁龙 888 发热降频很凶，持续降频时减少并发能止损一点。
+     *
+     * <p>三条纪律是老实现缺的，也是「越用越顿」的直接原因：
+     * <ol>
+     *   <li><b>要有绝对门槛</b>：冷机头几句特别快，基线被钉在 200ms 之后，正常
+     *       六七百毫秒也算「超基线 2.5 倍」，一上来就被降档。</li>
+     *   <li><b>要有下限</b>：降到 1 线程时 NLLB-600M 每句要好几秒，「省电」变成「卡」，
+     *       与同传的初衷相反，所以最低只到 {@link #MIN_MT_THREADS}。</li>
+     *   <li><b>要能回升</b>：机器凉下来之后必须把档位升回去，否则一次偶发抖动就永久锁死。</li>
+     * </ol>
+     * <p>只在 mtExec 单线程上调用，fastStreak/latencyBaselineMs 不需要额外同步。
      */
     private void guardPerformance() {
         if (mt == null || mtStats.count() < 5) return;
         long avg = mtStats.avgMs();
         if (latencyBaselineMs == 0) {
-            latencyBaselineMs = Math.max(200, avg);
+            latencyBaselineMs = Math.max(300, avg);
             return;
         }
-        if (avg > latencyBaselineMs * 2.5) {
-            int level = degradeLevel.incrementAndGet();
-            if (level == 1) {
-                mt.setThreads(2);
-                updateNotification("设备发热，已降到 2 线程");
-            } else if (level == 2) {
-                mt.setThreads(1);
+        long base = latencyBaselineMs;
+        int level = degradeLevel.get();
+        if (avg > base * 2.5 && avg > DEGRADE_FLOOR_MS) {
+            fastStreak = 0;
+            if (level == 0 && prefs.mtThreads() > MIN_MT_THREADS) {
+                mt.setThreads(MIN_MT_THREADS);
+                degradeLevel.set(1);
+                latencyBaselineMs = avg;
+                updateNotification("设备发热，翻译已降到 " + MIN_MT_THREADS + " 线程");
+                Log.i(TAG, String.format(Locale.ROOT,
+                        "PerfGuard 降级: avg=%dms 基线=%dms → %d 线程", avg, base, MIN_MT_THREADS));
+            } else if (level <= 1 && prefs.beamForTier() > 1) {
                 mt.setBeam(1);
-                updateNotification("设备发热，已降到 1 线程 / beam=1");
+                degradeLevel.set(2);
+                latencyBaselineMs = avg;
+                updateNotification("设备发热，解码宽度已降到 beam=1");
+                Log.i(TAG, String.format(Locale.ROOT,
+                        "PerfGuard 降级: avg=%dms 基线=%dms → beam=1", avg, base));
             }
-            latencyBaselineMs = avg; // 重新建立基线，避免反复降级
+        } else if (level > 0 && avg < base * 1.3) {
+            if (++fastStreak >= RECOVER_STREAK) {
+                fastStreak = 0;
+                mt.setThreads(prefs.mtThreads());
+                mt.setBeam(prefs.beamForTier());
+                degradeLevel.set(0);
+                latencyBaselineMs = Math.max(300, avg);
+                Log.i(TAG, String.format(Locale.ROOT,
+                        "PerfGuard 回升: avg=%dms → %d 线程 / beam=%d",
+                        avg, prefs.mtThreads(), prefs.beamForTier()));
+            }
+        } else {
+            fastStreak = 0;
         }
     }
 
@@ -578,6 +833,18 @@ public class TranslateService extends Service {
                 .setPackage(getPackageName())
                 .putExtra(EXTRA_STATE, state)
                 .putExtra(EXTRA_MESSAGE, message));
+    }
+
+    /**
+     * 电平广播：约 240ms 一次。不碰会话快照（电平不是会话内容），
+     * 也不走通知防抖，UI 没在前台时它就是个被丢掉的本地广播，成本可忽略。
+     */
+    private void broadcastLevel(double dbfs, double agcDb) {
+        if (!running) return;
+        sendBroadcast(new Intent(ACTION_LEVEL)
+                .setPackage(getPackageName())
+                .putExtra(EXTRA_DBFS, (float) dbfs)
+                .putExtra(EXTRA_AGC_DB, (float) agcDb));
     }
 
     private void startAsForeground(String text) {
@@ -664,6 +931,16 @@ public class TranslateService extends Service {
             shuttingDown = true;
         }
         running = false;
+        enginesReady = false;
+        synchronized (pendingLock) {
+            pendingSegments.clear(); // 旧会话攒的段对新会话没有意义
+        }
+        // 碎句兜底与"定稿优先"计数都要归零：否则残句会在服务停止后又被翻一次，
+        // 而 finalQueued 卡在正值会让下一轮会话的增量预览永远被跳过。
+        mainHandler.removeCallbacks(tailFlushGuard);
+        finalQueued.set(0);
+        lastSegLang = null;
+        lastSegmentAtMs = 0;
 
         // 1) 停音频 → 停定时器 → 停 VAD。整段与 startCaptureLocked 共用 lifecycleLock，
         //    保证不会出现「shutdown 先跑，startCapture 后把 vad/capture/partialTimer

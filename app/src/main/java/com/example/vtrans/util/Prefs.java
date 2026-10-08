@@ -23,8 +23,14 @@ public final class Prefs {
     private static final String K_PARTIAL_INTERVAL = "partial_interval";
     /** 基准测试测出来的最佳 provider */
     private static final String K_BENCH_PROVIDER = "bench_provider";
-    /** 收音增益（远场增强），单位 dB：0 / 6 / 12 */
+    /** 收音增益（远场增强），单位 dB：0 / 6 / 12 / 18 */
     private static final String K_MIC_BOOST_DB = "mic_boost_db";
+    /**
+     * 采集采样率：16000（默认）/ 48000。
+     * <p>48k 采集后软件抽取到 16k 再送模型。部分 ROM 在 16k 直通通路上会限带/强降噪，
+     * 高采样率通路能拿到更多原始信息；不是所有机器都给 48k，打不开会自动退回 16k。
+     */
+    private static final String K_CAPTURE_RATE_HZ = "capture_rate_hz";
     /**
      * 语音前置处理方案：auto / system / software / off。
      * 见 AUDIO_AUTO 等常量；改动在下次点「开始翻译」时生效。
@@ -101,13 +107,25 @@ public final class Prefs {
         return sp.getString(K_AUDIO_MODE, AUDIO_AUTO);
     }
 
-    /** 收音预增益 dB：0=标准 / 6=增强 / 12=远场。远场档用于手机放远、免提、人声偏小场景。 */
+    /**
+     * 收音预增益 dB：0=标准 / 6=增强 / 12=远场 / 18=极远场。
+     * <p>预增益现在才真正有效：软件链不再把识别路的信号门控掉，且噪声底会先标定。
+     */
     public int micBoostDb() {
         return sp.getInt(K_MIC_BOOST_DB, 0);
     }
 
     public void setMicBoostDb(int v) {
-        sp.edit().putInt(K_MIC_BOOST_DB, Math.max(0, Math.min(12, v))).apply();
+        sp.edit().putInt(K_MIC_BOOST_DB, Math.max(0, Math.min(18, v))).apply();
+    }
+
+    /** 采集采样率 Hz，只认 16000 / 48000，其他值按默认处 16k 处理。 */
+    public int captureRateHz() {
+        return sp.getInt(K_CAPTURE_RATE_HZ, 16000);
+    }
+
+    public void setCaptureRateHz(int v) {
+        sp.edit().putInt(K_CAPTURE_RATE_HZ, v == 48000 ? 48000 : 16000).apply();
     }
 
     /** 译文语音播报：true=仅检测到耳机时才朗读；false=是否插耳机都朗读。默认开启。 */

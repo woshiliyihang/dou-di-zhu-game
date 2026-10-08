@@ -1,26 +1,33 @@
 package com.example.vtrans.audio;
 
 /**
- * 软件语音前置处理链（16kHz / 单声道 / float[-1,1]，20ms 一帧 320 点，原地处理）。
+ * 软件语音前置处理链（16kHz / 单声道 / float[-1,1]，20ms 一帧 320 点）。
  *
- * <p>当系统音效（AEC/NS/AGC）缺失或用户选了「纯软件」方案时使用，按顺序处理：
+ * <p>当系统音效（AEC/NS/AGC）缺失或用户选了「纯软件」方案时使用。<b>一次分析、两路输出</b>：
  * <pre>
- *   90Hz 高通(去直流/去低频嗡声) → 降噪门控(带挂尾，压停顿期底噪)
- *       → 自动增益 AGC(升增益为主，安静语音拉起来) → 软限幅(防爆音)
+ *   高通(90Hz) → 包络/噪声底分析 ┬─→ 门控 → AGC → 软限幅  → 送 VAD 的那一路
+ *                                └────────→ AGC → 软限幅  → 送 ASR 的那一路
  * </pre>
+ *
+ * <p><b>为什么必须分两路</b>：降噪门控对「切句」有利（停顿期把底噪压掉，VAD 不容易被
+ * 噪声误触发），但对「识别」有害 —— 轻声说话的包络本来就只比噪声底高几 dB，
+ * 门一关就把整句压成 1/4 音量送进模型，结果是彻底认不出。VAD 需要干净，
+ * ASR 需要完整，这两个诉求互相矛盾，只能分路各取所需。
  *
  * <p>设计原则：
  * <ul>
  *   <li><b>零额外延迟</b>：全部因果、逐采样处理，不给实时链路加一帧缓冲。</li>
  *   <li><b>零分配</b>：process() 内不 new 对象、不调库，避免 GC 打扰音频线程。</li>
- *   <li><b>保守</b>：AGC 只做「升增益」，不主动压缩大声语音；限幅只拦峰值。</li>
- *   <li>AGC/门控的门限都基于实测噪声底自适应，安静环境不放大底噪、大声环境不误杀。</li>
+ *   <li><b>噪声底无条件双向跟踪</b>：降快升慢，且开机先做一段标定。老实现只在
+ *       env 低于门限时才更新噪声底，真实底噪一旦高于初始值就永远卡死在初值上。</li>
+ *   <li><b>AGC 不依赖门控状态</b>：只看「包络是否高于噪声底若干倍」。若像老实现那样
+ *       要求 active 才抬增益，而 active 又要求信号够响，两者互等 → 轻声永远进不去。</li>
  * </ul>
  *
- * <p>说明：软件降噪是「门控 + 停顿期压低」级别的轻量降噪。真正的宽频降噪/去混响/
- * 回声消除（需要参考信号）依赖系统 AEC/NS 链路，或后续把 SpeexDSP / WebRTC APM
- * 编进 native 层（见 HANDOVER 的 native 目录）。本类保证的是：没有系统效果时
- * 管线依然能拿到干净、响度一致、不削顶的语音，而不是输出毛刺。
+ * <p>说明：软件降噪仍是「门控 + 停顿期压低」级别的轻量处理。真正的宽频降噪/去混响/
+ * 回声消除（需要参考信号）依赖系统 AEC/NS 链路，或后续把 SpeexDSP / WebRTC APM /
+ * GTCRN 这类神经降噪编进 native 层。本类保证的是：没有系统效果时管线依然能拿到
+ * 响度一致、不被自己压死的语音信号。
  */
 public final class VoicePreprocessor {
 
@@ -36,25 +43,39 @@ public final class VoicePreprocessor {
     private static final double ENV_ATT = 1.0 - Math.exp(-1.0 / (0.004 * RATE)); // 起音 4ms
     private static final double ENV_REL = 1.0 - Math.exp(-1.0 / (0.150 * RATE)); // 释放 150ms
 
-    // ---------- 噪声底 / 门控 ----------
-    private static final double NOISE_FLOOR_INIT = 1e-4;   // 初始噪声底 ~ -80dBFS
-    private static final double ABS_GATE_FLOOR = 4e-5;     // 绝对门限下限（低于它就全是电子底噪）
-    private static final double GATE_RATIO = 4.0;          // 门限 = 噪声底 × 4
-    private static final double GATE_ENTER = 1.35;         // 超过门限 1.35× 判「说话开始」（迟滞）
-    private static final double GATE_EXIT = 0.5;           // 低于门限一半才可能判「说话结束」
-    private static final int HANG = (int) (150 * RATE / 1000.0); // 挂尾 150ms，句间不抖
-    private static final double FLOOR_DOWN = 0.01;         // 噪声底向下跟随时常数（~几 ms）
-    private static final double FLOOR_UP = 2e-5;           // 噪声底缓慢回升速率（环境噪声变化）
+    // ---------- 噪声底 ----------
+    private static final double NOISE_FLOOR_INIT = 5e-4;   // 保守初值，随后由标定期修正
+    private static final double NOISE_FLOOR_MIN = 1e-5;    // -100dBFS，电子底噪量级
+    private static final double NOISE_FLOOR_MAX = 0.05;    // -26dBFS，异常场景下别把门限推到天上
+    private static final double NF_FALL = 0.02;            // 向下跟随 ~3ms（环境变安静要马上跟上）
+    private static final double NF_RISE = 5e-5;            // 向上跟随 ~1.2s（环境变吵慢慢抬，且只在非说话期）
 
-    private static final double GATE_OPEN = 1.0 - Math.exp(-1.0 / (0.006 * RATE));  // 开门 6ms
-    private static final double GATE_CLOSE = 1.0 - Math.exp(-1.0 / (0.120 * RATE)); // 关门 120ms
-    private static final float GATE_LEAK = 0.02f;           // 门全关时的泄漏（不静音死，防咔哒）
+    /** 启动标定窗口：期间门全开、AGC 冻结在 1，只让噪声底快速收敛到真实电平 */
+    private static final int CALIB_SAMPLES = (int) (0.4 * RATE);
+    private static final double NF_CALIB = 2e-3;           // 标定期双向快速跟随（时间常数 ~0.03s）
 
-    // ---------- AGC（升增益为主） ----------
-    private static final double AGC_TARGET_ABS = 0.04;      // 目标平均绝对值 ≈ -28dBFS
-    private static final double AGC_MAX_GAIN = 8.0;         // 最大 +18dB，防止把底噪抬上天
-    private static final double AGC_RAISE = 1.0 - Math.exp(-1.0 / (0.030 * RATE)); // 起 30ms
-    private static final double AGC_FALL = 1.0 - Math.exp(-1.0 / (0.250 * RATE));  // 落 250ms
+    // ---------- 门控（只作用于送 VAD 的那一路） ----------
+    private static final double ABS_GATE_FLOOR = 2e-5;     // 绝对门限下限
+    private static final double GATE_RATIO = 2.2;          // 门限 = 噪声底 × 2.2（原来 4 倍，轻声必被关死）
+    private static final double GATE_ENTER = 1.12;         // 迟滞：超过门限 1.12× 判「说话开始」（原 1.35）
+    private static final double GATE_EXIT = 0.6;           // 低于门限 0.6× 才判「说话结束」
+    private static final int HANG = (int) (250 * RATE / 1000.0); // 挂尾 250ms，句间不抖
+
+    private static final double GATE_OPEN = 1.0 - Math.exp(-1.0 / (0.003 * RATE));  // 开门 3ms（原 6ms，抢字头）
+    private static final double GATE_CLOSE = 1.0 - Math.exp(-1.0 / (0.150 * RATE)); // 关门 150ms
+    /**
+     * 门全关时的泄漏量。原来 0.02(-34dB) 作用在<b>送识别</b>的信号上，等于把轻声整句抹掉；
+     * 现在这一路只喂 VAD，且提到 0.25(-12dB)，只做「停顿期别太吵」，静音判定交给 VAD。
+     */
+    private static final double GATE_LEAK = 0.25;
+
+    // ---------- AGC（两路共用同一个增益，只抬不压） ----------
+    private static final double AGC_TARGET_ABS = 0.06;     // 目标平均绝对值 ≈ -24dBFS（原 -28 偏轻）
+    private static final double AGC_MAX_GAIN = 12.0;       // ≈ +21.5dB（原 +18dB 对远场不够）
+    private static final double AGC_RAISE = 1.0 - Math.exp(-1.0 / (0.012 * RATE)); // 起 12ms（原 30ms 会吃掉句首）
+    private static final double AGC_FALL = 1.0 - Math.exp(-1.0 / (0.400 * RATE));  // 落 400ms
+    /** AGC 判「像语音」只看信噪比，<b>不看门控的 active</b> —— 依赖 active 是老实现的死锁点 */
+    private static final double AGC_SNR_RATIO = 2.5;
 
     // ---------- 软限幅 ----------
     private static final double LIMIT_SOFT = 0.85;          // 拐点
@@ -68,14 +89,15 @@ public final class VoicePreprocessor {
     // ---------- 状态 ----------
     private double env;             // 短时包络
     private double noiseFloor;      // 自适应噪声底
-    private boolean active;         // 是否判定为在说话
+    private boolean active;         // 门控是否判定为在说话（只影响送 VAD 的那一路）
     private int hang;               // 挂尾计数器
     private double gateGain = 1.0;
     private double agcGain = 1.0;
+    private int calib;              // 剩余标定采样数
 
     // ---------- 观测值（供日志/状态用，音频线程读写） ----------
     private double inPeak;
-    private double outPeak;
+    private double outPeak;         // 送 ASR 那一路的峰值（电平表/诊断看这个才有意义）
 
     public VoicePreprocessor(boolean hpf, boolean ns, boolean agc) {
         this.doHpf = hpf;
@@ -99,61 +121,86 @@ public final class VoicePreprocessor {
         a2 = A2 / A0;
     }
 
-    /** 处理一帧。len 一般=320。返回前原地写回。 */
-    public void process(float[] io, int len) {
+    /**
+     * 处理一帧：一次分析，同时产出两路信号。
+     *
+     * @param vadIo   原地读写的 VAD 路（高通 + 门控 + AGC + 限幅）
+     * @param asrOut  长度为 len 的输出缓冲，写入 ASR 路（高通 + AGC + 限幅，<b>无门控</b>）
+     * @param len     一般 = 320
+     */
+    public void process(float[] vadIo, float[] asrOut, int len) {
         inPeak = 0;
         outPeak = 0;
         for (int i = 0; i < len; i++) {
-            double x = io[i];
-
+            double x = vadIo[i];
             if (doHpf) x = hpf(x);
+
+            boolean calibrating = calib > 0;
+            if (calibrating) calib--;
 
             double ax = Math.abs(x);
             if (ax > inPeak) inPeak = ax;
             env += (ax - env) * (ax >= env ? ENV_ATT : ENV_REL);
 
-            double thr = Math.max(noiseFloor * GATE_RATIO, ABS_GATE_FLOOR);
-            if (active) {
-                if (env < thr * GATE_EXIT) {
-                    if (--hang <= 0) active = false;
-                } else {
+            // ---------- 噪声底：标定期快速双向收敛；之后降快升慢 ----------
+            // 老实现把这个更新挂在「env 低于门限」的条件里，真实底噪一旦高于初值
+            // 就永远不进分支，噪声底冻在 1e-4 → AGC 把底噪当语音抬 8 倍。
+            if (calibrating) {
+                noiseFloor += (env - noiseFloor) * NF_CALIB;
+            } else if (!active) {
+                noiseFloor += (env - noiseFloor) * (env < noiseFloor ? NF_FALL : NF_RISE);
+            }
+            if (noiseFloor < NOISE_FLOOR_MIN) noiseFloor = NOISE_FLOOR_MIN;
+            if (noiseFloor > NOISE_FLOOR_MAX) noiseFloor = NOISE_FLOOR_MAX;
+
+            // ---------- 活跃判定（带迟滞 + 挂尾） ----------
+            if (!calibrating) {
+                double thr = Math.max(noiseFloor * GATE_RATIO, ABS_GATE_FLOOR);
+                if (active) {
+                    if (env < thr * GATE_EXIT) {
+                        if (--hang <= 0) active = false;
+                    } else {
+                        hang = HANG;
+                    }
+                } else if (env > thr * GATE_ENTER) {
+                    active = true;
                     hang = HANG;
                 }
-            } else if (env > thr * GATE_ENTER) {
-                active = true;
-                hang = HANG;
-            } else if (env < thr) {
-                // 静音区：噪声底向下跟（快）、缓慢回升（慢），保持对环境自适
-                noiseFloor += (env - noiseFloor) * (env < noiseFloor ? FLOOR_DOWN : FLOOR_UP);
             }
 
-            // 门控增益（压停顿期底噪；说话/刚说完用挂尾保持全开）
-            if (doNs) {
-                double target = active ? 1.0 : GATE_LEAK;
-                double c = target > gateGain ? GATE_OPEN : GATE_CLOSE;
-                gateGain += (target - gateGain) * c;
-            } else {
-                gateGain = 1.0;
-            }
-
-            // AGC：只把「够不到目标响度的语音」抬上来，底噪区/大声区回到 1
+            // ---------- AGC：只看信噪比，不依赖 active ----------
+            // 标定期冻结在 1，避免拿未校准的噪声底做决定；标定结束后 12ms 就能抬起来。
             if (doAgc) {
-                double target = 1.0;
-                boolean speechLike = active && env > noiseFloor * 2.0;
-                if (speechLike && env < AGC_TARGET_ABS) {
-                    target = Math.min(AGC_MAX_GAIN, AGC_TARGET_ABS / Math.max(env, 1e-6));
+                if (calibrating) {
+                    agcGain = 1.0;
+                } else {
+                    double target = 1.0;
+                    if (env > noiseFloor * AGC_SNR_RATIO && env < AGC_TARGET_ABS) {
+                        target = Math.min(AGC_MAX_GAIN, AGC_TARGET_ABS / Math.max(env, 1e-6));
+                    }
+                    double c = target > agcGain ? AGC_RAISE : AGC_FALL;
+                    agcGain += (target - agcGain) * c;
                 }
-                double c = target > agcGain ? AGC_RAISE : AGC_FALL;
-                agcGain += (target - agcGain) * c;
             } else {
                 agcGain = 1.0;
             }
+            double agc = doAgc ? agcGain : 1.0;
 
-            double y = x * gateGain * agcGain;
-            y = limiter(y);
-            double ay = Math.abs(y);
-            if (ay > outPeak) outPeak = ay;
-            io[i] = (float) y;
+            // ---------- ASR 路：不过门控 ----------
+            double asrY = limiter(x * agc);
+            double aasr = Math.abs(asrY);
+            if (aasr > outPeak) outPeak = aasr;
+            asrOut[i] = (float) asrY;
+
+            // ---------- VAD 路：额外乘门控增益，压停顿期底噪 ----------
+            if (doNs) {
+                double gTarget = (calibrating || active) ? 1.0 : GATE_LEAK;
+                double c = gTarget > gateGain ? GATE_OPEN : GATE_CLOSE;
+                gateGain += (gTarget - gateGain) * c;
+            } else {
+                gateGain = 1.0;
+            }
+            vadIo[i] = (float) limiter(x * gateGain * agc);
         }
     }
 
@@ -166,6 +213,7 @@ public final class VoicePreprocessor {
         hang = 0;
         gateGain = 1.0;
         agcGain = 1.0;
+        calib = CALIB_SAMPLES;
         inPeak = 0;
         outPeak = 0;
     }
@@ -191,23 +239,33 @@ public final class VoicePreprocessor {
         return v;
     }
 
-    /** 最近一帧输入峰值（0~1）。 */
+    /** 最近一帧输入峰值（0~1，高通后）。 */
     public double inputPeak() {
         return inPeak;
     }
 
-    /** 最近一帧输出峰值（0~1）。 */
+    /** 最近一帧送 ASR 那一路的峰值（0~1）。 */
     public double outputPeak() {
         return outPeak;
     }
 
-    /** 当前 AGC 增益(dB)，≈+18dB 封顶。 */
+    /** 当前 AGC 增益(dB)，≈+21.5dB 封顶。 */
     public double agcGainDb() {
         return 20 * Math.log10(Math.max(agcGain, 1e-6));
     }
 
-    /** 当前门控是否全开。 */
+    /** 软件 AGC 是否开着（电平兜底要用）。 */
+    public boolean agcEnabled() {
+        return doAgc;
+    }
+
+    /** 门控是否全开（只看 VAD 路）。 */
     public boolean gateOpen() {
         return gateGain > 0.9;
+    }
+
+    /** 自适应噪声底（dBFS），诊断用。 */
+    public double noiseFloorDb() {
+        return 20 * Math.log10(Math.max(noiseFloor, 1e-9));
     }
 }

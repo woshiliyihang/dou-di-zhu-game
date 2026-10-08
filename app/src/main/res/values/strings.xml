@@ -17,6 +17,8 @@
     <string name="status_running">正在聆听…</string>
     <string name="status_stopped">已停止</string>
 
+    <string name="level_quiet_hint">声音太小：离麦远、音量低或隔着桌子都会认不出。可以靠近说、大点声，或在设置里调高「收音增益」。</string>
+
     <string name="need_permission">需要麦克风权限才能翻译</string>
     <string name="need_models">首次使用需要把内置模型解包到手机（约 %1$s）</string>
     <string name="models_missing_in_apk">APK 里缺少模型文件：%1$s</string>
@@ -30,12 +32,16 @@
     <string name="settings_audio">录音处理（回声/降噪/增益）</string>
     <string name="audio_auto">自动（推荐）：系统优先，缺项软件补；外放播报时自动启用回声消除</string>
     <string name="audio_system">系统链路：手机自带 AEC/降噪/增益（通话音源）</string>
-    <string name="audio_software">纯软件：高通滤波 + 降噪 + 自动增益</string>
+    <string name="audio_software">纯软件：高通滤波 + 自动增益 + 限幅（降噪门只作用于切句，不进识别）</string>
     <string name="audio_off">关闭：原始信号</string>
     <string name="settings_mic_range">收音增益（扩大收音范围）</string>
     <string name="mic_normal">标准：0dB（贴近使用）</string>
     <string name="mic_boost">增强：+6dB（1~2 米）</string>
     <string name="mic_far">远场：+12dB（2 米外/免提，大声环境慎用）</string>
+    <string name="mic_very_far">极远场：+18dB（3 米以上，底噪会明显上升）</string>
+    <string name="settings_capture_rate">采集采样率</string>
+    <string name="capture_high_rate">高精度采集：48kHz 采集后转 16kHz</string>
+    <string name="capture_rate_hint">开启后先按 48kHz 录音再软件降采到 16kHz。部分机型的 16kHz 直通通路会限带或强降噪，高采样率通路能拿到更多原始信息，轻声/远场可能更清楚；代价是略增 CPU 与功耗。机器不支持 48kHz 时会自动退回 16kHz。改动下次「开始翻译」生效。</string>
     <string name="settings_provider">加速后端（ASR）</string>
     <string name="settings_threads">翻译线程数</string>
     <string name="settings_beam">解码宽度（beam）</string>

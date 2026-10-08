@@ -95,6 +95,10 @@ public final class AsrEngine {
     public String transcribe(Which which, float[] samples) {
         OfflineRecognizer r = which == Which.WHISPER ? whisper : senseVoice;
         if (r == null || samples == null || samples.length == 0) return null;
+        // 整段响度归一化：SenseVoice/Whisper 的 fbank 只减训练集的全局均值，
+        // 不是逐句归一，所以输入峰值偏低时识别率会跳崖式下跌。这一步对轻声场景
+        // 比任何前端调参都直接。（注意：会原地改 samples，调用方必须传自己拥有的副本）
+        normalizePeak(samples);
         OfflineStream stream = null;
         try {
             stream = r.createStream();
@@ -119,6 +123,30 @@ public final class AsrEngine {
     /** SenseVoice 在 auto 模式下偶尔会带出 &lt;|zh|&gt; 这类标签，去掉再上屏 */
     private static final java.util.regex.Pattern TAG_PATTERN =
             java.util.regex.Pattern.compile("<\\|[^|]*\\|>");
+
+    // ---------- 整段响度归一化 ----------
+    /** 目标峰值 ≈ -3dBFS */
+    private static final float NORM_TARGET_PEAK = 0.7f;
+    /** 峰值已经到 -16dBFS 以上就不动，避免把本来就响的句子推到限幅区 */
+    private static final float NORM_MIN_PEAK = 0.15f;
+    /** 最多抬 ≈+21.5dB：再多的话一段纯噪声会被抬成“很响的噪声”，反而诱使模型编造文字 */
+    private static final float NORM_MAX_GAIN = 12.0f;
+    /** 低于此峰值视为静音/无信号，不抬 */
+    private static final float NORM_NOISE_PEAK = 1e-4f;
+
+    /** 原地把整段峰值抬到 {@link #NORM_TARGET_PEAK}，只抬不压。 */
+    static void normalizePeak(float[] x) {
+        if (x == null || x.length == 0) return;
+        float peak = 0;
+        for (float v : x) {
+            float a = Math.abs(v);
+            if (a > peak) peak = a;
+        }
+        if (peak < NORM_NOISE_PEAK || peak >= NORM_MIN_PEAK) return;
+        float g = NORM_TARGET_PEAK / peak;
+        if (g > NORM_MAX_GAIN) g = NORM_MAX_GAIN;
+        for (int i = 0; i < x.length; i++) x[i] *= g;
+    }
 
     static String cleanup(String text) {
         if (text == null) return null;

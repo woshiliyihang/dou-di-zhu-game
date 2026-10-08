@@ -108,6 +108,14 @@ public class SettingsActivity extends AppCompatActivity {
             prefs.setMicBoostDb(micBoostDbOf(id));
             updateAudioDiag(prefs.audioMode());
         });
+
+        // ---- 采集采样率（48k 高采样率通路实验开关） ----
+        SwitchCompat swRate = findViewById(R.id.swCaptureRate);
+        swRate.setChecked(prefs.captureRateHz() == 48000);
+        swRate.setOnCheckedChangeListener((b, checked) -> {
+            prefs.setCaptureRateHz(checked ? 48000 : 16000);
+            updateAudioDiag(prefs.audioMode());
+        });
         updateAudioDiag(prefs.audioMode());
 
         // ---- provider ----
@@ -184,7 +192,8 @@ public class SettingsActivity extends AppCompatActivity {
                 hint = "强制通话音源：手机自带 AEC/降噪/增益最可能生效（骁龙机型），缺项软件自动补。";
                 break;
             case Prefs.AUDIO_SOFTWARE:
-                hint = "不挂系统效果，全部内置算法：90Hz 高通去低频、降噪门控、自动增益、软限幅。";
+                hint = "不挂系统效果，全部内置算法：90Hz 高通去低频、自动增益、软限幅；"
+                        + "降噪门只作用于切句那一路，不会压掉送识别的轻声。";
                 break;
             case Prefs.AUDIO_OFF:
                 hint = "不做任何处理，原始信号直接送识别。";
@@ -206,22 +215,28 @@ public class SettingsActivity extends AppCompatActivity {
                 + (autoToCall && SystemAudioEffects.aecAvailable()
                         ? "\n回声消除：已因外放播报切到通话音源（AEC 优先）" : "")
                 + "\n收音增益： " + boost
+                + "\n采集采样率： " + (prefs.captureRateHz() == 48000
+                        ? "48kHz（软件降到 16kHz，机器不支持时自动退回 16kHz）"
+                        : "16kHz（默认）")
                 + "\n改动下次「开始翻译」生效；实际挂载见 logcat 标签 AudioCapture");
     }
 
     private static String boostLabel(int db) {
-        if (db >= 12) return "+12dB 远场（预抬电平，让远场人声进入 VAD/AGC 触发区间）";
+        if (db >= 18) return "+18dB 极远场（3 米以上；底噪会明显抬升，优先配合 48kHz 采集试）";
+        if (db >= 12) return "+12dB 远场（2 米以上/免提）";
         if (db >= 6) return "+6dB 增强（1~2 米）";
         return "0dB 标准（贴近使用）";
     }
 
     private static int micBoostRadioId(int db) {
+        if (db >= 18) return R.id.rbMicVeryFar;
         if (db >= 12) return R.id.rbMicFar;
         if (db >= 6) return R.id.rbMicBoost;
         return R.id.rbMicNormal;
     }
 
     private static int micBoostDbOf(int radioId) {
+        if (radioId == R.id.rbMicVeryFar) return 18;
         if (radioId == R.id.rbMicFar) return 12;
         if (radioId == R.id.rbMicBoost) return 6;
         return 0;

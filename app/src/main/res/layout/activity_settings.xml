@@ -186,7 +186,37 @@
                 android:layout_height="wrap_content"
                 android:text="@string/mic_far"
                 android:textColor="@color/text_primary" />
+
+            <RadioButton
+                android:id="@+id/rbMicVeryFar"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="@string/mic_very_far"
+                android:textColor="@color/text_primary" />
         </RadioGroup>
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="12dp"
+            android:text="@string/settings_capture_rate"
+            android:textColor="@color/text_secondary"
+            android:textSize="13sp" />
+
+        <androidx.appcompat.widget.SwitchCompat
+            android:id="@+id/swCaptureRate"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="4dp"
+            android:text="@string/capture_high_rate"
+            android:textColor="@color/text_primary" />
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="@string/capture_rate_hint"
+            android:textColor="@color/text_secondary"
+            android:textSize="12sp" />
 
         <View
             android:layout_width="match_parent"
