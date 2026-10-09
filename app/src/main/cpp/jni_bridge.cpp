@@ -1,12 +1,15 @@
 // JNI 桥接层：仅 Android 编译。宿主工程用 mt_engine.h 直接调用，不经过 JNI。
 #include <jni.h>
 
+#include <exception>
 #include <string>
 #include <vector>
 
 #include "mt_engine.h"
 
 namespace {
+
+thread_local std::string lastInitError;
 
 vtrans::MtEngine* asEngine(jlong h) {
   return reinterpret_cast<vtrans::MtEngine*>(h);
@@ -24,14 +27,40 @@ JNIEXPORT jlong JNICALL
 Java_com_example_vtrans_pipeline_MtEngine_nativeInit(JNIEnv* env, jclass,
                                                      jstring model_dir,
                                                      jint threads, jint beam) {
+  lastInitError.clear();
+  if (!model_dir) {
+    lastInitError = "model directory is null";
+    return 0;
+  }
   const char* c = env->GetStringUTFChars(model_dir, nullptr);
-  if (!c) return 0;
+  if (!c) {
+    lastInitError = "failed to read model directory";
+    return 0;
+  }
   std::string dir(c);
   env->ReleaseStringUTFChars(model_dir, c);
 
-  auto engine = vtrans::MtEngine::create(dir, threads, beam);
-  if (!engine || !engine->ready()) return 0;
-  return reinterpret_cast<jlong>(engine.release());
+  try {
+    auto engine = vtrans::MtEngine::create(dir, threads, beam);
+    if (!engine) {
+      lastInitError = "native engine creation returned null";
+      return 0;
+    }
+    if (!engine->ready()) {
+      lastInitError = engine->lastError();
+      if (lastInitError.empty()) lastInitError = "native engine is not ready";
+      return 0;
+    }
+    return reinterpret_cast<jlong>(engine.release());
+  } catch (const std::exception& e) {
+    lastInitError = std::string("native initialization exception: ") + e.what();
+    return 0;
+  }
+}
+
+JNIEXPORT jstring JNICALL
+Java_com_example_vtrans_pipeline_MtEngine_nativeLastInitError(JNIEnv* env, jclass) {
+  return toJString(env, lastInitError);
 }
 
 JNIEXPORT jstring JNICALL

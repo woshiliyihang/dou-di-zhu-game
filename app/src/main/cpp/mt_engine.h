@@ -1,5 +1,5 @@
 #pragma once
-// NLLB-200 (CTranslate2 int8) 翻译引擎 —— host 与 Android 共用同一份源码。
+// CTranslate2 int8 翻译引擎 —— host 与 Android 共用同一份源码。
 //
 // 输入/输出都是 std::string，不含任何 JNI，便于在 x86 上跑通验证后再交叉编译。
 
@@ -19,7 +19,7 @@ std::string detectSourceLang(const std::string& text);
 
 class MtEngine {
  public:
-  // model_dir 下需含 model.bin / sentencepiece.bpe.model / shared_vocabulary.txt
+  // model_dir 下需含 CTranslate2 权重/词表，以及 NLLB 或 Marian/OPUS-MT SentencePiece 文件。
   static std::unique_ptr<MtEngine> create(const std::string& model_dir,
                                           int threads = 4,
                                           int beam_size = 1);
@@ -41,6 +41,7 @@ class MtEngine {
   virtual void setBeamSize(int beam) = 0;
   virtual void setThreads(int threads) = 0;
   virtual bool ready() const = 0;
+  virtual std::string lastError() const = 0;
 };
 
 }  // namespace vtrans

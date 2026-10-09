@@ -1,16 +1,18 @@
 #!/usr/bin/env bash
-# Download the required ASR and English-to-Chinese translation models.
+# Download the required SenseVoice/VAD ASR and English-to-Chinese translation models.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
 OUT="${MODELS_DIR:-app/src/main/assets/models}"
 WORK="${WORK_DIR:-.models}"
+LICENSE_DIR="${LICENSE_DIR:-$(dirname "$OUT")/licenses}"
 CHUNKDL="python tools/chunkdl.py"
 WORKERS="${WORKERS:-24}"
 CHUNK="${CHUNK:-2M}"
 SHERPA="https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models"
 HF="https://huggingface.co/jiangzhuo9357/opus-mt-en-zh-ct2/resolve/06fb49e2f6cb0485043ae703a4c2afddd4e700d7"
+SENSEVOICE="https://huggingface.co/csukuangfj/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17/resolve/2365baeacb507f821a0c8120fcee3d484dba7a07"
 
 get() {
   $CHUNKDL "$1" "$2" --workers "$WORKERS" --chunk "$CHUNK" ${3:+--sha256 "$3"}
@@ -22,30 +24,23 @@ msys_path() {
 }
 
 echo "==> Output directory: $OUT"
-mkdir -p "$OUT/vad" "$OUT/zipformer-en" "$WORK"
+mkdir -p "$OUT/vad" "$OUT/sense-voice" "$WORK"
 
 echo "==> Silero VAD v5 (int8)"
 get "$SHERPA/silero_vad.int8.onnx" "$OUT/vad/silero_vad.int8.onnx" \
     c36d490aff5ab924ca6c7aeec4d8f6bd3d22db6fa17611b9c5b17eae58ac3a20
 
-echo "==> Streaming English Zipformer (int8)"
-ZF_PKG="$WORK/sherpa-onnx-streaming-zipformer-en-2023-06-26.tar.bz2"
-get "$SHERPA/sherpa-onnx-streaming-zipformer-en-2023-06-26.tar.bz2" "$ZF_PKG"
-ZF="$OUT/zipformer-en"
-if [ ! -f "$ZF/tokens.txt" ]; then
-  mkdir -p "$ZF" "$WORK/zipformer-en"
-  tar -xjf "$(msys_path "$ZF_PKG")" -C "$(msys_path "$WORK/zipformer-en")" --strip-components=1
-  cp "$WORK/zipformer-en/encoder-epoch-99-avg-1-chunk-16-left-128.int8.onnx" "$ZF/"
-  cp "$WORK/zipformer-en/decoder-epoch-99-avg-1-chunk-16-left-128.onnx" "$ZF/"
-  cp "$WORK/zipformer-en/joiner-epoch-99-avg-1-chunk-16-left-128.int8.onnx" "$ZF/"
-  cp "$WORK/zipformer-en/tokens.txt" "$ZF/"
-  rm -rf "$WORK/zipformer-en"
-fi
+echo "==> SenseVoice-Small multilingual int8 (fixed English input)"
+get "$SENSEVOICE/model.int8.onnx" "$WORK/sense-voice/model.int8.onnx" \
+    c71f0ce00bec95b07744e116345e33d8cbbe08cef896382cf907bf4b51a2cd51
+get "$SENSEVOICE/tokens.txt" "$WORK/sense-voice/tokens.txt" \
+    f449eb28dc567533d7fa59be34e2abca8784f771850c78a47fb731a31429a1dc
+cp "$WORK/sense-voice/model.int8.onnx" "$OUT/sense-voice/model.int8.onnx"
+cp "$WORK/sense-voice/tokens.txt" "$OUT/sense-voice/tokens.txt"
 
 echo "==> OPUS-MT English-to-Chinese CTranslate2 int8 (offline model)"
 MT_WORK="$WORK/opus-mt-en-zh"
 MT_OUT="$OUT/opus-mt-en-zh"
-LICENSE_DIR="${LICENSE_DIR:-$(dirname "$OUT")/licenses}"
 mkdir -p "$MT_WORK" "$MT_OUT" "$LICENSE_DIR"
 get "$HF/model.bin" "$MT_WORK/model.bin" \
     327584c20bb83c7e89d595bcfa30b6ef3771c10816f707e892c4bbb1f808a8fb
@@ -65,6 +60,12 @@ LICENSE="$LICENSE_DIR/Apache-2.0.txt"
 if [ ! -s "$LICENSE" ]; then
   curl -fL --retry 3 \
     https://www.apache.org/licenses/LICENSE-2.0.txt -o "$LICENSE"
+fi
+SENSEVOICE_LICENSE="$LICENSE_DIR/MIT-FunASR.txt"
+if [ ! -s "$SENSEVOICE_LICENSE" ]; then
+  curl -fL --retry 3 \
+    https://raw.githubusercontent.com/modelscope/FunASR/main/LICENSE \
+    -o "$SENSEVOICE_LICENSE"
 fi
 
 echo

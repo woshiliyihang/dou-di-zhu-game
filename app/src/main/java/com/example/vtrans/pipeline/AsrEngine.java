@@ -12,16 +12,7 @@ import com.k2fsa.sherpa.onnx.OfflineStream;
 
 import java.util.Locale;
 
-/**
- * ASR 引擎：SenseVoice（快）与 Whisper-small（准）二选一，按语种和档位决定。
- *
- * <p>实测结论（tools/engine_compare.py）：
- * <ul>
- *   <li>SenseVoice int8 中文/粤语很准，RTF≈0.06；但日/韩/英基本不可用。</li>
- *   <li>Whisper-small int8 各语种都明显更准，代价是慢 6~10 倍（RTF≈0.35）。</li>
- * </ul>
- * 所以默认走"SenseVoice 先出结果，发现不是中文再用 Whisper 重跑"的组合。
- */
+/** SenseVoice-Small offline recognizer; VAD supplies complete, trimmed utterances. */
 public final class AsrEngine {
 
     private static final String TAG = "AsrEngine";

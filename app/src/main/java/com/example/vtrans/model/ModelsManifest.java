@@ -22,9 +22,9 @@ public final class ModelsManifest {
             "vad", "Silero VAD v5 (int8)", true,
             "vad/silero_vad.int8.onnx");
 
-    // ---- SenseVoice-Small (int8)：可选的离线备用识别模型 ----
+    // ---- SenseVoice-Small (int8)：离线英文识别主模型 ----
     public static final Model SENSEVOICE = new Model(
-            "sensevoice", "SenseVoice-Small (int8)", false,
+            "sensevoice", "SenseVoice-Small (int8)", true,
             "sense-voice/model.int8.onnx",
             "sense-voice/tokens.txt");
 
@@ -36,12 +36,9 @@ public final class ModelsManifest {
             "whisper/small-decoder.int8.onnx",
             "whisper/small-tokens.txt");
 
-    // ---- 流式英文 Zipformer (int8)：固定英→中方向的主识别器 ----
-    // 与 SenseVoice 的整段识别不同：边说边出字，句子边界由 endpoint 规则判。
-    // 好处不是“算得更快”，而是“说话的那段时间已经在算了”——说完之后
-    // 几乎不需要再等识别，判停等待和整段重跑一起消失。
+    // ---- 流式英文 Zipformer (int8)：保留旧资源定义，不再用于识别 ----
     public static final Model ZIPFORMER_EN = new Model(
-            "zipformer-en", "Streaming Zipformer EN (int8)", true,
+            "zipformer-en", "Streaming Zipformer EN (int8)", false,
             "zipformer-en/encoder-epoch-99-avg-1-chunk-16-left-128.int8.onnx",
             "zipformer-en/decoder-epoch-99-avg-1-chunk-16-left-128.onnx",
             "zipformer-en/joiner-epoch-99-avg-1-chunk-16-left-128.int8.onnx",
@@ -56,9 +53,9 @@ public final class ModelsManifest {
             "opus-mt-en-zh/source.spm",
             "opus-mt-en-zh/target.spm");
 
-    /** 启动必需：VAD、英文流式识别与英中翻译模型。 */
+    /** 启动必需：VAD、SenseVoice 英文识别与英中翻译模型。 */
     public static Model[] required() {
-        return new Model[]{VAD, ZIPFORMER_EN, OPUS_MT_EN_ZH};
+        return new Model[]{VAD, SENSEVOICE, OPUS_MT_EN_ZH};
     }
 
     /** 模型条目：files 是相对路径，archive 那套下载/解压逻辑已经随离线打包去掉了。 */

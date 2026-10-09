@@ -51,7 +51,7 @@ import java.util.concurrent.atomic.AtomicInteger;
  * 前台服务，持有整条翻译管线：
  *
  * <pre>
- * AudioCapture(20ms 帧) → StreamingAsr(English) → SentenceSplitter
+ * AudioCapture(20ms 帧) → Silero VAD → SenseVoice(English) → SentenceSplitter
  *      → MtEngine/OPUS-MT (English→Chinese) → 广播给 UI
  * </pre>
  *
@@ -101,8 +101,7 @@ public class TranslateService extends Service {
     private TtsSpeaker tts;
 
     /**
-     * 流式识别引擎。非 null 时它就是主识别器：音频只喂 {@link #feedStreaming}；
-     * 流式英文模型是必需项，缺失或加载失败会明确报错，不切换到其他识别器。
+     * 旧 Zipformer 流式路径仅为兼容保留，本服务固定使用 VAD + SenseVoice。
      */
     private StreamingAsr streaming;
     private ExecutorService streamExec;
@@ -136,11 +135,7 @@ public class TranslateService extends Service {
     private final Stats asrStats = new Stats(8);
     private final Stats mtStats = new Stats(8);
 
-    /**
-     * 引擎还在加载时抵达的语音段。点「开始翻译」到英文流式识别模型装好需要时间，
-     * 而用户往往就在这段时间开口 —— 所以先开录音、把这段里的段攒着，引擎就绪后按序补跑。
-     * 只在录音线程写入、asrExec 读取/排空，统一用 {@code pendingLock}。
-     */
+    /** 引擎加载期间由 VAD 切出的语音段，待 ASR 就绪后按序补跑。 */
     private static final int MAX_PENDING_SEGMENTS = 6;
     private final Object pendingLock = new Object();
     private final ArrayDeque<float[]> pendingSegments = new ArrayDeque<>();
@@ -271,9 +266,6 @@ public class TranslateService extends Service {
         asrStats.reset();
         mtStats.reset();
         perfSentenceSeq.set(0);
-        streamDrops.set(0);
-        streamBacklog.set(0);
-        slowFeedCount = 0;
         audioFrames = 0;
         splitter.reset();
         // startForeground 可能因「后台启动 FGS 被系统拒绝」「通知被用户禁用」抛异常：
@@ -301,9 +293,8 @@ public class TranslateService extends Service {
      * 起录音 + 加载模型。
      *
      * <p><b>顺序很关键</b>：先建 VAD（只有约 208KB）并把麦克风升起来，
-     * 再解包并加载英文流式识别模型。老顺序是先装模型再开录音，
-     * 中间那 1~5 秒里根本没在采集，用户点完按钮本能就开口，第一句整段丢失。
-     * 现在这段时间里的语音段进了 {@link #pendingSegments}，引擎就绪后按序补跑。
+     * 再解包并加载 SenseVoice。模型加载期间 VAD 仍持续切段，
+     * 这些段先进入 {@link #pendingSegments}，引擎就绪后按序补跑。
      */
     private void initAndRun() {
         try {
@@ -397,9 +388,6 @@ public class TranslateService extends Service {
     }
 
     private void loadEngines(String provider) {
-        if (!streamingIntended) {
-            throw new IllegalStateException("缺少英文流式识别模型，请重新安装完整模型包");
-        }
         long mtLoadStarted = android.os.SystemClock.elapsedRealtime();
         unpackIfNeeded(ModelsManifest.OPUS_MT_EN_ZH);
         try {
@@ -411,7 +399,7 @@ public class TranslateService extends Service {
             throw t;
         }
         if (mt == null) {
-            translationModelError = "CTranslate2 无法加载内置 OPUS-MT 模型";
+            translationModelError = "CTranslate2 无法加载内置 OPUS-MT 模型（nativeInit 返回空句柄）";
             Log.e(PERF_TAG, "stage=mt_load status=error elapsed_ms="
                     + (android.os.SystemClock.elapsedRealtime() - mtLoadStarted)
                     + " reason=" + translationModelError);
@@ -424,27 +412,25 @@ public class TranslateService extends Service {
                 + " model=opus-mt-en-zh-int8");
         if (running) broadcastStatus("running", "英→中翻译模型已就绪");
 
-        unpackIfNeeded(ModelsManifest.ZIPFORMER_EN);
+        unpackIfNeeded(ModelsManifest.SENSEVOICE);
         long asrLoadStarted = android.os.SystemClock.elapsedRealtime();
-        StreamingAsr s = StreamingAsr.create(models, "cpu",
-                Math.min(2, Runtime.getRuntime().availableProcessors()));
+        AsrEngine s = AsrEngine.create(models, providerOfAsr(),
+                Math.min(2, Runtime.getRuntime().availableProcessors()),
+                prefs.sourceLang());
         if (s == null) {
-            throw new IllegalStateException("英文流式识别模型加载失败");
+            throw new IllegalStateException("SenseVoice 英文识别模型加载失败");
         }
         Log.i(PERF_TAG, "stage=asr_load status=ok elapsed_ms="
                 + (android.os.SystemClock.elapsedRealtime() - asrLoadStarted)
-                + " model=zipformer-en-int8");
-        warmUpStreaming(s);
-        streamExec = Executors.newSingleThreadExecutor(
-                r -> new Thread(r, "vtrans-stream"));
-        drainPendingFrames(s);
-        streaming = s;
+                + " model=sensevoice-int8");
+        warmUpSenseVoice(s);
+        asr = s;
     }
 
     /**
      * 模型已经随 APK 装进手机，但还要从 APK 拷到可读写的目录才能加载。
      * 这一步原来要人去设置页点「解包」——说话前先做一次手动配置没道理，
-     * 所以引擎加载前顺手拷掉（70MB 约 1 秒，期间音频帧已经攒在 pendingFrames 里）。
+     * 所以引擎加载前顺手拷掉，期间 VAD 仍可继续收音并缓存完整语音段。
      */
     private void unpackIfNeeded(ModelsManifest.Model m) {
         if (models.isReady(m)) {
@@ -466,15 +452,23 @@ public class TranslateService extends Service {
         }
     }
 
-    /** 拿随包的英文音频过一遍图：sherpa 首次 run 要做图优化与内存分配，明显更慢 */
-    private void warmUpStreaming(StreamingAsr s) {
-        long t0 = System.currentTimeMillis();
+    /** 拿随包英文音频预热 SenseVoice，避免首个真实语音段承担首次推理开销。 */
+    private void warmUpSenseVoice(AsrEngine engine) {
+        long t0 = android.os.SystemClock.elapsedRealtime();
         try {
-            float[] wav = WaveReader.read(this, "bench_en.wav");
-            s.warmUp(wav, 320);
-            Log.i(TAG, "流式预热完成，耗时 " + (System.currentTimeMillis() - t0) + "ms");
+            float[] samples = WaveReader.read(this, "bench_en.wav");
+            String text = engine.transcribe(AsrEngine.Which.SENSEVOICE, samples);
+            if (text == null || text.trim().isEmpty()) {
+                throw new IllegalStateException("SenseVoice 英文预热识别结果为空");
+            }
+            long elapsed = android.os.SystemClock.elapsedRealtime() - t0;
+            Log.i(PERF_TAG, "stage=asr_warmup status=ok engine=sensevoice elapsed_ms="
+                    + elapsed + " text_chars=" + text.length());
+            Log.i(TAG, "SenseVoice 预热完成，耗时 " + elapsed + "ms");
         } catch (Throwable t) {
-            Log.i(TAG, "流式预热跳过（不影响使用）: " + t.getMessage());
+            Log.e(PERF_TAG, "stage=asr_warmup status=error engine=sensevoice elapsed_ms="
+                    + (android.os.SystemClock.elapsedRealtime() - t0), t);
+            throw new IllegalStateException("SenseVoice 预热失败", t);
         }
     }
 
@@ -602,11 +596,7 @@ public class TranslateService extends Service {
     }
 
     private void startCaptureLocked(String provider) {
-        // 流式模型在不在，录音一开始就该知道：引擎还要加载 1~5s（首启还要多一次解包），
-        // 这段时间抵达的帧必须攒起来而不是交给 VAD，否则第一句会走错那条路子。
-        // 只查 isReady 不够：刚装完 APK 时模型在包里还没拷出来，那时候也该走流式。
-        streamingIntended = models.isReady(ModelsManifest.ZIPFORMER_EN)
-                || models.hasAsset(ModelsManifest.ZIPFORMER_EN);
+        streamingIntended = false;
         vad = new VadSegmenter(models.vadFile().getAbsolutePath(), 1, "cpu",
                 new VadSegmenter.Callback() {
                     @Override
@@ -624,22 +614,12 @@ public class TranslateService extends Service {
         capture = new AudioCapture(this, effectiveAudioMode(), new AudioCapture.Sink() {
             @Override
             public void onFrame(float[] vadFrame, float[] asrFrame, int len) {
-                // 心跳：每 100 帧报一次。这一行能直接分清三件事——帧到底有没有
-                // 进来、一帧实际多长、以及它是递给流式还是攒进 pending。
+                // 心跳：每 100 帧记录一次采集状态，便于确认音频持续送入 VAD。
                 if ((++audioFrames % 100) == 0) {
                     Log.i(TAG, "帧#" + audioFrames + " len=" + len
-                            + "（" + (len * 1000L / 16000) + "ms） streaming="
-                            + (streaming != null) + " intended=" + streamingIntended
-                            + " backlog=" + streamBacklog.get());
-                }
-                if (streaming != null) {
-                    feedStreaming(asrFrame, len);
-                    return;
-                }
-                if (streamingIntended) {
-                    // 流式引擎还在路上：帧先存着，就绪后按原顺序补喂，第一句不丢
-                    holdPendingFrame(asrFrame, len);
-                    return;
+                            + "（" + (len * 1000L / 16000) + "ms） asr=sensevoice"
+                            + " vad_speaking=" + (vad != null && vad.isSpeaking())
+                            + " engines_ready=" + enginesReady);
                 }
                 // 门控路只喂 VAD，无门控路进识别缓冲 —— 两者在 VadSegmenter 里分流
                 if (vad != null) vad.feed(vadFrame, asrFrame);
@@ -688,8 +668,6 @@ public class TranslateService extends Service {
         if (!running || !prefs.partialsEnabled() || vad == null) return;
         // 模型还没装好就别抢 asrExec（那段时间在排队的是攒下来的真音频）
         if (!enginesReady) return;
-        // 流式引擎在跑：它自己就提供增量文本，这套定时整段重跑既多余又会抢核
-        if (streaming != null) return;
         // 有定稿在跑或排队：这一拍预览直接跳过。预览晚一拍没人看得出，
         // 定稿晚一拍就是「说完话干等」。
         if (finalQueued.get() > 0) return;
@@ -727,9 +705,6 @@ public class TranslateService extends Service {
 
     /** 一句话说完：最终识别 + 切句 + 翻译 */
     private void submitFinal(float[] samples) {
-        // 流式引擎在跑：句边界由 endpoint 判，这一路不再产生段（正常走不到这里，
-        // 留着是防 shutdown/restart 交错时两个引擎同时上屏同一句）
-        if (streaming != null) return;
         // 模型还在加载：攒起来，等 drainPendingSegments() 按序补跑，而不是把这句话丢掉
         if (!enginesReady) {
             holdPendingSegment(samples);
@@ -750,60 +725,39 @@ public class TranslateService extends Service {
                 if (engine == null) { finalQueued.decrementAndGet(); return; }
                 long t0 = System.currentTimeMillis();
                 long queueMs = t0 - cutAt;
-                // finally 里 flush 时也要用同一个语种，"auto" 不能直接喂给 NLLB。
-                // 初值一定要是 null：没判出语种就干脆不翻，别让还没赋过值的
-                // 中文句子被当成英文送进去，输出看起来像“识别错了”。
+                // 固定英译中，分段结果和残句都使用英语源语言。
                 String srcLang = null;
                 long svMs = 0;
-                long whMs = 0;
                 try {
-                String srcSetting = prefs.sourceLang();
                 // 归一化前的峰值：transcribe() 会原地改 samples，事后再量就不准了
                 final float segPeak = peakOf(samples);
-                long tSv0 = System.currentTimeMillis();
+                long tSv0 = android.os.SystemClock.elapsedRealtime();
                 String text = engine.hasSenseVoice()
                         ? engine.transcribe(AsrEngine.Which.SENSEVOICE, samples)
                         : null;
-                svMs = System.currentTimeMillis() - tSv0;
+                svMs = android.os.SystemClock.elapsedRealtime() - tSv0;
+                srcLang = prefs.sourceLang();
 
-                // SenseVoice 的 auto 语种标签不可信（实测每个语种都返回 <|yue|>），
-                // 所以语种一律按"识别出来的文字用了哪种书写系统"来定。
-                String detected = "eng_Latn";
-                srcLang = srcSetting;
-
-                // Whisper 只在该用的时候用，且按语种懒加载（375MB 不常驻内存）。
-                // looksMissed：整段够长（≥1.2s，段首尾静音已被 VadSegmenter 裁掉）
-                // 却几乎没出字，这种时候值得花 6~10 倍时间用 Whisper 重跑一次
-                // （Whisper 对低电平更宽容）。
-                // segPeak 那道门不能省：Whisper 有个出名的毛病——给它接近静音的音频，
-                // 它会凭空编出一句话来，宁可少说也别上屏假字。
-                boolean looksMissed = samples.length >= (long) (1.2 * VadSegmenter.SAMPLE_RATE)
-                        && segPeak > MISSED_MIN_PEAK
-                        && (text == null || text.trim().length() <= 2);
-                boolean wantWhisper = shouldUseWhisper(detected, srcSetting)
-                        || text == null      // SenseVoice 失手时的兜底
-                        || looksMissed;      // 轻声/远场没认出来
-                if (wantWhisper && models.isReady(ModelsManifest.WHISPER)) {
-                    long tWh0 = System.currentTimeMillis();
-                    engine.switchWhisperLang(models, providerOfAsr(), providerThreads(), srcLang);
-                    String better = engine.transcribe(AsrEngine.Which.WHISPER, samples);
-                    whMs = System.currentTimeMillis() - tWh0;
-                    if (better != null && !better.isEmpty()) {
-                        text = better;
-                        // 以 Whisper 结果为准重判一次语种（兜底路径下 SenseVoice 没输出可判）
-                        srcLang = srcSetting;
-                    }
+                if (text == null || text.trim().isEmpty()) {
+                    Log.w(PERF_TAG, "stage=asr_segment status=empty engine=sensevoice"
+                            + " queue_ms=" + queueMs + " inference_ms=" + svMs
+                            + " segment_ms=" + (samples.length * 1000L
+                            / VadSegmenter.SAMPLE_RATE) + " peak=" + segPeak);
+                    return;
                 }
-
-                if (text == null || text.trim().isEmpty()) return;
 
                 long asrMs = System.currentTimeMillis() - t0;
                 asrStats.add(asrMs);
-                // 逐句链路日志：延迟到底卡在排队、SenseVoice、Whisper 还是翻译，一眼能看出来
+                // 逐句记录队列等待、SenseVoice 推理与 VAD 音频段长度。
                 Log.i(TAG, String.format(Locale.ROOT,
-                                "定稿: 音频%.2fs 排队%dms SenseVoice%dms Whisper%dms",
+                                "定稿: 音频%.2fs 排队%dms SenseVoice%dms",
                                 samples.length / (float) VadSegmenter.SAMPLE_RATE,
-                                queueMs, svMs, whMs));
+                                queueMs, svMs));
+                Log.i(PERF_TAG, "stage=asr_segment status=ok engine=sensevoice"
+                        + " queue_ms=" + queueMs + " inference_ms=" + svMs
+                        + " segment_ms=" + (samples.length * 1000L
+                        / VadSegmenter.SAMPLE_RATE) + " text_chars=" + text.length()
+                        + " peak=" + segPeak);
                 broadcast("final", text, srcLang, asrMs);
 
                 // 一次定稿切出多句时合并成一次解码调用（见 enqueueTranslation）
@@ -867,9 +821,6 @@ public class TranslateService extends Service {
         enqueueTranslation(splitter.flush(), lang);
     }
 
-    /** 低于这个峰值（≈ -40dBFS）的定稿段当作“基本只有底噪”，不值得花 Whisper 重跑 */
-    private static final float MISSED_MIN_PEAK = 0.01f;
-
     private static float peakOf(float[] x) {
         if (x == null) return 0f;
         float peak = 0f;
@@ -885,31 +836,6 @@ public class TranslateService extends Service {
         if (!"auto".equals(setting)) return setting;
         String benched = prefs.benchedProvider();
         return benched == null || benched.isEmpty() ? "cpu" : benched;
-    }
-
-    private int providerThreads() {
-        return Math.min(2, prefs.mtThreads());
-    }
-
-    /**
-     * 是否值得用 Whisper 再跑一遍（模型可用性由调用方判断，这里只回答"值不值得"）：
-     * 高精档一律重跑；均衡档只在 SenseVoice 不可靠的语言上重跑。
-     * <p>注意：SenseVoice 的中文/粤语又快又准，用户显式选了中文也不该被拖慢 6~10 倍。
-     */
-    private boolean shouldUseWhisper(String detected, String srcSetting) {
-        if (asr == null) return false;
-        if (Prefs.TIER_QUALITY.equals(prefs.tier())) return true;
-        if (!"auto".equals(srcSetting)) return !isZhish(srcSetting);
-        if (detected == null) return false;
-        return !detected.startsWith("zho") && !detected.startsWith("yue");
-    }
-
-    /** 中/粤（含 zh_/zho/cmn 等写法）→ 交给 SenseVoice 就够 */
-    private static boolean isZhish(String lang) {
-        String v = lang == null ? "" : lang.toLowerCase(Locale.ROOT);
-        return v.equals("zh") || v.equals("yue")
-                || v.startsWith("zh_") || v.startsWith("yue")
-                || v.startsWith("zho") || v.startsWith("cmn");
     }
 
     /**

@@ -36,20 +36,11 @@ int main(int argc, char** argv) {
             << " threads=" << threads << " beam=" << beam << std::endl;
 
   const std::vector<Case> cases = {
-      {"今天天气很好，我们一起去公园散步吧。", "zho_Hans", "eng_Latn"},
-      {"请问最近的地铁站在哪里？", "zho_Hans", "eng_Latn"},
-      {"我们要不要先吃饭再看电影？", "zho_Hans", "eng_Latn"},
       {"The meeting has been rescheduled to three o'clock tomorrow afternoon.",
        "eng_Latn", "zho_Hans"},
       {"Could you please speak a little slower?", "eng_Latn", "zho_Hans"},
       {"Artificial intelligence is changing the way we work.", "eng_Latn",
        "zho_Hans"},
-      {"これはテストです。音声翻訳の品質を確認しています。", "jpn_Jpan",
-       "zho_Hans"},
-      {"この製品の価格はいくらですか。", "jpn_Jpan", "eng_Latn"},
-      {"Bonjour, je voudrais réserver une table pour deux personnes.",
-       "fra_Latn", "eng_Latn"},
-      {"그는 아침에 일찍 일어났다.", "kor_Hang", "eng_Latn"},
   };
 
   int failed = 0;
@@ -68,18 +59,21 @@ int main(int argc, char** argv) {
               << "OUT\t" << out << std::endl;
   }
 
-  // 批量接口 + 吞吐（同一源语言才可成批，这里用前三句中文）
+  // 批量接口 + 吞吐
   std::vector<std::string> batch;
-  for (int i = 0; i < 3; ++i) batch.emplace_back(cases[i].text);
+  for (const auto& c : cases) batch.emplace_back(c.text);
   std::vector<std::string> outs;
   auto s = std::chrono::steady_clock::now();
-  const bool ok = engine->translateBatch(batch, "zho_Hans", "eng_Latn", outs);
+  const bool ok = engine->translateBatch(batch, "eng_Latn", "zho_Hans", outs);
   auto e = std::chrono::steady_clock::now();
   std::cout << "batch_ok=" << ok << " n=" << outs.size() << " total_ms="
             << std::chrono::duration<double, std::milli>(e - s).count()
             << std::endl;
-  for (size_t i = 0; i < outs.size(); ++i)
+  if (!ok || outs.size() != batch.size()) ++failed;
+  for (size_t i = 0; i < outs.size(); ++i) {
+    if (outs[i].empty()) ++failed;
     std::cout << "BATCH[" << i << "]\t" << outs[i] << std::endl;
+  }
 
   std::cout << (failed ? "RESULT=FAIL" : "RESULT=OK")
             << " failed=" << failed << std::endl;

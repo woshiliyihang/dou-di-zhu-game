@@ -17,10 +17,15 @@ public final class MtEngine {
         this.handle = handle;
     }
 
-    /** @return 引擎实例；模型加载失败返回 null */
+    /** @return 引擎实例；模型初始化失败时抛出包含 native 原因的异常 */
     public static MtEngine create(String modelDir, int threads, int beam) {
         long h = nativeInit(modelDir, threads, beam);
-        return h == 0 ? null : new MtEngine(h);
+        if (h == 0) {
+            String error = nativeLastInitError();
+            throw new IllegalStateException("翻译引擎初始化失败: "
+                    + (error == null || error.isEmpty() ? "未知 native 错误" : error));
+        }
+        return new MtEngine(h);
     }
 
     /** @return 译文；失败返回 null（调用方要降级处理，不能让整条管线挂掉） */
@@ -73,6 +78,8 @@ public final class MtEngine {
     }
 
     private static native long nativeInit(String modelDir, int threads, int beam);
+
+    private static native String nativeLastInitError();
 
     private static native String nativeTranslate(long handle, String text,
                                                  String srcLang, String tgtLang);

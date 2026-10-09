@@ -1,4 +1,4 @@
-// NLLB-200 (CTranslate2 int8) 翻译引擎实现 —— host 与 Android 共用。
+// CTranslate2 int8 翻译引擎实现（NLLB / Marian-OPUS-MT）—— host 与 Android 共用。
 #include "mt_engine.h"
 
 #include <algorithm>
@@ -243,7 +243,7 @@ class MtEngineImpl : public MtEngine {
     if (ready_) buildTranslator();
   }
   bool ready() const override { return ready_; }
-  std::string lastError() const { return last_error_; }
+  std::string lastError() const override { return last_error_; }
 
  private:
   std::string model_dir_;

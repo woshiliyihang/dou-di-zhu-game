@@ -245,10 +245,7 @@ public class ModelManager {
         }
     }
 
-    /**
-     * APK 里缺哪些必备模型文件（排查打包问题用）。
-     * 只检查当前必需的 VAD 与英文流式识别模型。
-     */
+    /** APK 里缺哪些必备模型文件（排查打包问题用）。 */
     public List<String> missingAssets() {
         List<String> out = new ArrayList<>();
         List<String> names = new ArrayList<>();

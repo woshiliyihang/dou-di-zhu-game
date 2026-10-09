@@ -32,7 +32,9 @@ find_package(OpenMP)
 file(GLOB VTRANS_DEPS "${VTRANS_PREFIX}/lib/libruy_*.a"
                       "${VTRANS_PREFIX}/lib/libcpuinfo.a"
                       "${VTRANS_PREFIX}/lib/libclog.a"
-                      "${VTRANS_PREFIX}/lib/libcpu_features.a")
+                      "${VTRANS_PREFIX}/lib/libcpu_features.a"
+                      "${VTRANS_PREFIX}/lib/libdnnl*.a"
+                      "${VTRANS_PREFIX}/lib/libopenblas*.a")
 
 # 注意链接顺序：libctranslate2.a 与其依赖放进同一个 group（互相引用），
 # OpenMP 放在最后，否则 GOMP 符号会被丢弃。
