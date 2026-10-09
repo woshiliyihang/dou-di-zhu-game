@@ -68,15 +68,19 @@ public final class ModelsManifest {
     // NLLB-600M int8 ≈600MB → 实测每 token 约 45ms；这个模型 ~60MB → 个位数 ms。
     // 它又只在英/中这一对语言上训过，准确率不比多语模型差，代价是换对语言就没法用。
     //
-    // 分词模型必须叫 sentencepiece.model：native 侧拿「有没有 sentencepiece.bpe.model」
-    // 当作「要不要加 NLLB 语言码前缀」的判据。下完还要重编 libvtrans-mt.so
-    // （见 tools/fetch_models.sh 的输出提示），旧 .so 加载它会失败并自动退回 NLLB。
+    // 分词器文件名以仓库实际内容为准（source.spm / target.spm）：native 侧
+    // firstExisting 的候选里就有 source.spm，而它拿「有没有 sentencepiece.bpe.model」
+    // 当作要不要加 NLLB 语言码前缀的判据——所以这个目录里**绝对不能出现**
+    // sentencepiece.bpe.model，否则会被当成 NLLB 处理、硬塞 eng_Latn 前缀。
+    // shared_vocabulary.json 是 CTranslate2 自己读的词条表，不能缺。
+    // 下完还要配套 libvtrans-mt.so（云端重编的那份），旧 .so 加载它会失败并自动退回 NLLB。
     public static final Model OPUS_MT_EN_ZH = new Model(
             "opus_mt_en_zh", "OPUS-MT en→zh (CT2)", false,
             "opus-mt-en-zh/model.bin",
             "opus-mt-en-zh/config.json",
-            "opus-mt-en-zh/sentencepiece.model",
-            "opus-mt-en-zh/vocabulary.txt");
+            "opus-mt-en-zh/source.spm",
+            "opus-mt-en-zh/target.spm",
+            "opus-mt-en-zh/shared_vocabulary.json");
 
     public static final Model[] ALL = {
             VAD, SENSEVOICE, NLLB_MODEL, NLLB_TOKENIZER, NLLB_VOCAB, WHISPER,

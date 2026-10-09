@@ -261,6 +261,17 @@ public class TranslateService extends Service {
 
         running = true;
         sRunning = true;
+        // 会话一开头就把构建号打进日志：手机上 Download 里同时躺着好几个 APK，
+        // 只有日志里的 bN 能跟推包脚本报的号对上。真机吃过一次亏：测了半天
+        // 「怎么没效果」，其实是装的还是昨天的旧包，而从界面上完全看不出来。
+        try {
+            android.content.pm.PackageInfo pi =
+                    getPackageManager().getPackageInfo(getPackageName(), 0);
+            Log.i(TAG, "构建 b" + (pi.versionCode - 10000) + "（" + pi.versionName + "/"
+                    + pi.versionCode + "）");
+        } catch (Exception e) {
+            Log.w(TAG, "取构建号失败", e);
+        }
         clearSnapshot(); // 新会话：历史文本清空，防止 UI 重建读到上一轮的残影
         // 新会话重新建基线：上一轮的降级档位和延迟基线留给这一轮没有任何意义
         // （引擎是新的，机器温度也是新的），否则会出现「上次热过、这次一上来就是低档」。
