@@ -40,54 +40,87 @@ cp -f "$SRC/sentencepiece/src/builtin_pb/sentencepiece.pb.h" \
 echo "sentencepiece 已安装到 $PREFIX"
 
 echo "################ 2/2 CTranslate2 ($ABI) ################"
+
+# —— 关于 SGEMM 后端：这里已经踩过一次真机崩溃，结论写在代码旁边才不会再踩 ——
+# 读 CT2 v3.24.0 的 CMakeLists.txt（第 357-382 行）可以确认：WITH_DNNL / WITH_OPENBLAS /
+# WITH_MKL 统统只是 find_path + find_library，找不到就 message(FATAL_ERROR ...)。
+# 它们**不会**帮你把后端源码拉下来编译。所以正确顺序是：先自己交叉编译出一个 arm64
+# 的 BLAS 静态库放进 $PREFIX/lib，再打开对应开关。
+# 而四个后端全关时，src/cpu/primitives.cc 走到 default 分支：
+#   throw std::runtime_error("No SGEMM backend on CPU")
+# 上一版交付的库就是这样在真机第一次调用翻译时 abort 的（只开 RUY 挡不住：
+# RUY 在 CT2 里只做 INT8 GEMM，FP32 的 SGEMM 没人接）。
+BACKEND_FLAGS=()
+BACKEND_SYM=""
+if [ -f "$PREFIX/lib/libdnnl.a" ]; then
+  echo "SGEMM 后端：oneDNN（$PREFIX/lib/libdnnl.a）"
+  BACKEND_FLAGS=(-DWITH_DNNL=ON -DDNNL_INCLUDE_DIR="$PREFIX/include" -DDNNL_LIBRARY="$PREFIX/lib/libdnnl.a")
+  BACKEND_SYM="dnnl_"
+elif [ -f "$PREFIX/lib/libopenblas.a" ]; then
+  echo "SGEMM 后端：OpenBLAS（$PREFIX/lib/libopenblas.a）"
+  BACKEND_FLAGS=(-DWITH_OPENBLAS=ON -DOPENBLAS_INCLUDE_DIR="$PREFIX/include" -DOPENBLAS_LIBRARY="$PREFIX/lib/libopenblas.a")
+  BACKEND_SYM="cblas_sgemm"
+else
+  cat >&2 <<'MISSING_BACKEND'
+ERROR: $PREFIX/lib 里没有任何 SGEMM 后端库，就地停下。
+再往下只会编出一个“加载能过、第一次翻译就 abort”的 libvtrans-mt.so，那比没有更糟。
+
+先交叉编译一个后端、把产物放进 $PREFIX/lib（二选一），再重跑本脚本：
+
+  # 首选 oneDNN（CT2 在 ARM 上推荐，需要 Linux host）
+  git clone --depth 1 https://github.com/oneapi-src/oneDNN.git
+  cmake -S oneDNN -B oneDNN/build \
+    -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake \
+    -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-28 -DANDROID_STL=c++_static \
+    -DCMAKE_BUILD_TYPE=Release -DDNNL_BUILD_TESTS=OFF -DDNNL_BUILD_EXAMPLES=OFF \
+    -DDNNL_LIBRARY_TYPE=STATIC
+  cmake --build oneDNN/build -j8 --target install
+  # 结果把 include/dnnl.h 与 libdnnl.a 放到 $PREFIX/include 与 $PREFIX/lib
+  # （名字必须是 libdnnl.a，本脚本靠它识别后端）
+
+  # 或者 OpenBLAS（只要能提供 cblas_sgemm）：编完命名成 libopenblas.a 放进 $PREFIX/lib
+
+注意 MKL 与 ACCELERATE 在 Android 上没有对应实现，永远保持 OFF。
+MISSING_BACKEND
+  exit 1
+fi
+
 mkdir -p "$SRC/ctranslate2/build-$ABI"
 cmake -S "$SRC/ctranslate2" -B "$SRC/ctranslate2/build-$ABI" \
   "${COMMON_TOOLCHAIN[@]}" \
   -DBUILD_SHARED_LIBS=OFF \
   -DBUILD_CLI=OFF \
   -DBUILD_TESTS=OFF \
-  -DWITH_MKL=OFF -DWITH_DNNL=ON -DWITH_OPENBLAS=OFF -DWITH_ACCELERATE=OFF \
+  -DWITH_MKL=OFF -DWITH_DNNL=OFF -DWITH_OPENBLAS=OFF -DWITH_ACCELERATE=OFF \
   -DWITH_CUDA=OFF -DWITH_CUDNN=OFF -DWITH_HIP=OFF -DWITH_TENSOR_PARALLEL=OFF \
   -DWITH_RUY=ON \
   -DOPENMP_RUNTIME=COMP \
   -DENABLE_CPU_DISPATCH=ON \
-  -DCMAKE_INSTALL_PREFIX="$PREFIX"
-# ↑ 这一行是上一版真机崩溃的直接原因，不要再改回去：
-#   上一版把 MKL/DNNL/OPENBLAS/ACCELERATE 全关、只开 RUY，结果 sgemm.cc 走到
-#   “无后端”分支，运行时抛 std::runtime_error("No SGEMM backend on CPU") 并 abort。
-#   RUY 不能当 SGEMM 用：它在 CT2 里只负责 INT8 GEMM（量化算子），FP32 矩阵乘
-#   必须有人接，否则加载 INT8 模型后第一句翻译就死。
-#   oneDNN（DNNL）是 CT2 在 ARM 上的推荐后端，且支持 AArch64 交叉编译。
-#   MKL 没有 Android/arm64 版本，所以只能靠 DNNL，继续保持 OFF。
-# CT2 v3.24.0 没有 deps 汇总 target；其 third_party 依赖（含 oneDNN）随 install 的目标依赖图构建。
-# 注意：oneDNN 源码在 CT2 仓的 git submodule 里，clone 必须带 --recurse-submodules，
-# 否则 WITH_DNNL=ON 会被 CMake 默默退回成无后端（那就又编出一个会 abort 的库）。
+  -DCMAKE_INSTALL_PREFIX="$PREFIX" \
+  "${BACKEND_FLAGS[@]}"
+# ↑ 基础行把四个后端一律写 OFF，再由 BACKEND_FLAGS 在命令行末尾覆盖成要的那个：
+#   cmake 后面的 -D 会覆盖前面的，这个顺序不能颠倒。
+# CT2 v3.24.0 的 git submodule 只有 cxxopts/thrust/googletest/cpu_features/spdlog/ruy，
+# **里面没有 oneDNN**，所以 --recurse-submodules 拉不出后端，别指望它。
 cmake --build "$SRC/ctranslate2/build-$ABI" -j"$JOBS" --target install
 
-# 后端自检：没后端就不要往下走，否则白编一轮还得等真机崩了才知道
-DNNL_LIB=$(find "$SRC/ctranslate2/build-$ABI" -name 'libdnnl*.a' -o -name 'libonednn*.a' 2>/dev/null | head -1)
+# 后端自检：确认开关真的生效了，而不是只看它被打开过。
 CT2_A="$PREFIX/lib/libctranslate2.a"
-if [ -z "${DNNL_LIB}" ]; then
-  echo "ERROR: 没找到 oneDNN 静态库（libdnnl.a），WITH_DNNL=ON 实际并未生效" >&2; exit 1
-fi
 if ! command -v llvm-nm >/dev/null 2>&1; then
   LLVM_NM=$(find "$ANDROID_NDK_HOME" -name 'llvm-nm' -type f 2>/dev/null | head -1)
 else
   LLVM_NM=llvm-nm
 fi
-DNNL_REFS=$($LLVM_NM -u "$CT2_A" 2>/dev/null | grep -c dnnl || true)
-echo "SGEMM 后端检查：libdnnl=${DNNL_LIB}  libctranslate2.a 引用的 dnnl 符号=${DNNL_REFS}"
-# 这里用 -u（未定义符号）而不是 --defined-only：oneDNN 自己是个独立静态库，
-# CT2 只“引用”dnnl_*。所以引用数 > 0 才说明 WITH_DNNL=ON 真的生效了。
-if [ "$DNNL_REFS" -lt 1 ]; then
-  echo "ERROR: libctranslate2.a 里没有引用任何 dnnl 符号，等于无后端，上真机必 abort" >&2; exit 1
+# 用 -u（未定义符号）而不是 --defined-only：后端是个独立静态库，CT2 只“引用”它，
+# 所以引用数 > 0 才说明后端真的被编进去了。
+BACKEND_REFS=$($LLVM_NM -u "$CT2_A" 2>/dev/null | grep -c "$BACKEND_SYM" || true)
+echo "SGEMM 后端检查：libctranslate2.a 引用 $BACKEND_SYM 的个数 = ${BACKEND_REFS}"
+if [ "${BACKEND_REFS:-0}" -lt 1 ]; then
+  echo "ERROR: libctranslate2.a 没引用任何 $BACKEND_SYM，等于无后端，上真机必 abort" >&2; exit 1
 fi
 
 # libctranslate2.a 依赖 ruy 与 cpu_features，二者不会随 install 一起落盘，手动拷过去
 mkdir -p "$PREFIX/lib"
-# oneDNN 同理：它是独立静态库，而 libctranslate2.a 里引用了成百个 dnnl_*。
-# 不把它放进 $PREFIX/lib，下一步链 libvtrans-mt.so 时会直接 undefined symbol。
-cp -f "$DNNL_LIB" "$PREFIX/lib/" 2>/dev/null || true
 cp -f "$SRC"/ctranslate2/build-"$ABI"/third_party/ruy/ruy/libruy_*.a "$PREFIX/lib/" 2>/dev/null || true
 cp -f "$SRC"/ctranslate2/build-"$ABI"/third_party/ruy/ruy/profiler/instrumentation.a \
       "$PREFIX/lib/libruy_profiler.a" 2>/dev/null || true

@@ -189,16 +189,29 @@ Abort message: 'terminating due to uncaught exception of type
 运行时抛 `std::runtime_error` → `abort()` → Java 层 `catch(Throwable)` 抢不到（
 因为进程直接退出了）。INT8 模型一样要跑浮点矩阵乘，所以症状是：加载能过、一解码就死。
 
-这一行我已经改成 `-DWITH_DNNL=ON`，并另外做了三道防呆（**不达标脚本会直接 exit 1，
-不会再把一个会崩的库推回来**）：
+**但委托人第一版任务书写错了一件事，这里更正：光把开关改成 `-DWITH_DNNL=ON` 是编不出来的。**
+读 CT2 v3.24.0 的 `CMakeLists.txt` 第 357-382 行可以确认，`WITH_DNNL` / `WITH_OPENBLAS` /
+`WITH_MKL` 统统只是 `find_path` + `find_library`，找不到现成的库就 `FATAL_ERROR`——它们不会
+替你 clone，更不会替你编译 oneDNN。而且 CT2 的 git submodule 只有 cxxopts / thrust /
+`googletest` / cpu_features / spdlog / ruy，**里面根本没有 oneDNN**，`--recurse-submodules`
+也拉不出来。
 
-1. `build_android.sh`：配置完就查 `libdnnl.a` 是否存在、`libctranslate2.a` 里是否真的
-   引用了 `dnnl_*`（用 `llvm-nm -u`，因为 oneDNN 是个独立静态库，CT2 只“引用”它）。
-2. `build_android.sh`：把 `libdnnl.a` 拷进 `$PREFIX/lib`。这一步不能省：
-   `app/src/main/cpp/CMakeLists.txt` 是用 `file(GLOB $PREFIX/lib/*.a)` 拉依赖库的，
-   不放进 prefix 就链不进去。
-3. `cloud_build.sh`：交付前再查一次最终 `.so` 里的 oneDNN 字符串（`strings` 的
-   好处是符号表被 strip 也照样能查）。
+所以上一版把四个后端关掉并非乱改：交叉环境里确实没有任何现成 BLAS 可找。它缺的是
+“关掉之后真机会 abort”这个判断，而这一条本该由委托人写清楚，是我的疏漏。
+
+正确顺序是**先备料、再开关**。`native/build_android.sh` 已按这个逻辑重写：配置 CT2 之前
+先查 `$PREFIX/lib/libdnnl.a`（或 `libopenblas.a`），有就用缓存变量 `-DDNNL_INCLUDE_DIR` /
+`-DDNNL_LIBRARY` 把路径直接喂进去（绕过 `find_*`），没有就**在配置阶段 `exit 1`** 并打印
+准备后端的命令。所以现在直接跑 `cloud_build.sh` 会在第一步停住，**这是预期行为**——
+不要绕过它，更不要改回“无后端也继续编”。
+
+三道防呆保留：
+
+1. `build_android.sh`：CT2 装完立刻用 `llvm-nm -u` 查 `libctranslate2.a` 是否真的引用了
+   `dnnl_*`（后端是独立静态库，CT2 只“引用”它，引用数 > 0 才算生效）。
+2. 后端库必须在 `$PREFIX/lib` 里：`app/src/main/cpp/CMakeLists.txt` 用
+   `file(GLOB $PREFIX/lib/*.a)` 拉依赖，不在那里就链不进去。
+3. `cloud_build.sh`：交付前再查一次最终 `.so` 里的 oneDNN 字符串（`strings` 不受 strip 影响）。
 
 ### 你要做的
 
@@ -208,8 +221,30 @@ Abort message: 'terminating due to uncaught exception of type
 ```bash
 git fetch origin
 git checkout -B master origin/master      # 硬对齐远端 master，不要 merge
-bash native/cloud_build.sh
 ```
+
+**第 0 步：先交叉编译 oneDNN 到 arm64-v8a（本轮真正的工作量在这里）**
+
+```bash
+export ANDROID_NDK_HOME=/opt/android-ndk-r26d          # cloud_build.sh 用的同一个
+export PREFIX=/tmp/native-prefix/arm64
+mkdir -p "$PREFIX/include" "$PREFIX/lib"
+git clone --depth 1 https://github.com/oneapi-src/oneDNN.git /tmp/oneDNN
+cmake -S /tmp/oneDNN -B /tmp/oneDNN/build \
+  -DCMAKE_TOOLCHAIN_FILE="$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake" \
+  -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-28 -DANDROID_STL=c++_static \
+  -DCMAKE_BUILD_TYPE=Release -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
+  -DDNNL_BUILD_TESTS=OFF -DDNNL_BUILD_EXAMPLES=OFF -DDNNL_LIBRARY_TYPE=STATIC
+cmake --build /tmp/oneDNN/build -j8
+find /tmp/oneDNN/build -name 'libdnnl*.a' -exec cp -f {} "$PREFIX/lib/libdnnl.a" \;
+cp -f /tmp/oneDNN/build/include/dnnl.h "$PREFIX/include/"
+ls -l "$PREFIX/lib/libdnnl.a" "$PREFIX/include/dnnl.h"    # 这两个不存在就是没编成
+```
+
+备料完成后才跑 `bash native/cloud_build.sh`。
+
+云端是 Ubuntu host，而 oneDNN 官方的 Android 交叉编译只保证 Linux host——这正是云端
+比委托人本机强的地方。撞上 host 工具或 ISA 相关报错时，按下一节的命令定位，别硬改源码。
 
 编完把产物推到 `native-build` 分支（见本节末尾），**不要推 master**：委托人从 master 取脚本、
 从 native-build 取 `.so`，两条线分开才不会互相踩。
