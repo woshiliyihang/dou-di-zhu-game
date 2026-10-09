@@ -19,6 +19,7 @@ import com.example.vtrans.audio.SystemAudioEffects;
 import com.example.vtrans.model.ModelManager;
 import com.example.vtrans.model.ModelsManifest;
 import com.example.vtrans.pipeline.AsrEngine;
+import com.example.vtrans.pipeline.MtEngine;
 import com.example.vtrans.util.Prefs;
 import com.example.vtrans.util.WaveReader;
 
@@ -131,8 +132,10 @@ public class SettingsActivity extends AppCompatActivity {
                 pos -> prefs.setMtBeam(pos == 1 ? 4 : 1)));
 
         // ---- 线程数 ----
-        sbThreads.setMax(4);
-        sbThreads.setProgress(Math.min(4, prefs.mtThreads()));
+        // 上限从 4 放开到 8：骁龙 888 是 1+3+4 八个核，NLLB 解码每 token 约 45ms
+        // 是全链路最大的一块，4 线程从没喂满过，到底吃到几核最快得实测（见 benchMt）。
+        sbThreads.setMax(8);
+        sbThreads.setProgress(Math.min(8, prefs.mtThreads()));
         updateThreadsLabel(prefs.mtThreads());
         sbThreads.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
             @Override
@@ -393,7 +396,24 @@ public class SettingsActivity extends AppCompatActivity {
                 }
 
                 prefs.setBenchedProvider(bestProvider);
-                report.append("\n已选中最快后端: ").append(bestProvider);
+                report.append("\n已选中最快后端: ").append(bestProvider).append("\n\n");
+
+                // 翻译线程基准：正在翻译时不测，两边抢核测出来不准
+                if (TranslateService.isRunning()) {
+                    report.append("（翻译进行中，跳过线程基准：会互相抢核）\n");
+                } else {
+                    final int bestThreads = benchMt(report);
+                    if (bestThreads > 0) {
+                        prefs.setMtThreads(bestThreads);
+                        report.append("\n已选中最快线程数: ").append(bestThreads);
+                        runOnUiThread(() -> {
+                            SeekBar sb = findViewById(R.id.sbThreads);
+                            sb.setProgress(bestThreads);
+                            updateThreadsLabel(bestThreads);
+                        });
+                    }
+                }
+
                 final String finalReport = report.toString();
                 runOnUiThread(() -> showReport(finalReport));
             } catch (IOException e) {
@@ -406,6 +426,89 @@ public class SettingsActivity extends AppCompatActivity {
                 });
             }
         });
+    }
+
+    /** 翻译线程基准用的固定句子：短/中/长各一句英文口语 */
+    private static final String[] MT_SENTENCES = {
+            "Could you help me with this?",
+            "I would like to book a table for two people tonight if that is possible.",
+            "The meeting was postponed because the client from Berlin had to catch "
+                    + "an early flight in the morning.",
+    };
+
+    /**
+     * 翻译线程数实测：解码每 token 的开销是全链路最大的一笔等待，而线程上限一直钉在 4。
+     * 到底 6/8 线程是更快还是因为落到 A55 小核反而更慢，只能在这台机器上测，猜不出来。
+     *
+     * <p>全程用同一个引擎实例改线程数（{@code setThreads} 会重建 translator），
+     * 避免同时握着两份几百 MB 的模型副本。
+     *
+     * @return 每句平均最快的线程数；引擎不可用或中断返回 -1（调用方就不改设置）
+     */
+    private int benchMt(StringBuilder report) {
+        if (!models.allRequiredReady()) {
+            report.append("（模型未就绪，跳过翻译线程基准）\n");
+            return -1;
+        }
+        final int[] candidates = {2, 4, 6, 8};
+        java.io.File dir = models.mtDir();
+        MtEngine engine = MtEngine.create(dir.getAbsolutePath(), candidates[0], prefs.beamForTier());
+        if (engine == null && !dir.equals(models.nllbDir())) {
+            // 语对专用模型要新版 libvtrans-mt.so 才认；旧 .so 下退回 NLLB 接着测
+            dir = models.nllbDir();
+            engine = MtEngine.create(dir.getAbsolutePath(), candidates[0], prefs.beamForTier());
+        }
+        if (engine == null) {
+            report.append("翻译引擎不可用，跳过线程基准\n");
+            return -1;
+        }
+        int bestThreads = -1;
+        long bestMs = Long.MAX_VALUE;
+        try {
+            String tgt = prefs.targetLang();
+            report.append("翻译基准（").append(dir.getName())
+                    .append(", beam=").append(prefs.beamForTier())
+                    .append("，取两次最快）:\n");
+            for (int th : candidates) {
+                engine.setThreads(th);
+                // 热车：首次解码要建工作缓冲，不算进成绩
+                engine.translate(MT_SENTENCES[0], "eng_Latn", tgt);
+                long bestRun = Long.MAX_VALUE;
+                int bestChars = 0;
+                for (int rep = 0; rep < 2; rep++) {
+                    long total = 0;
+                    int repChars = 0;
+                    for (String s : MT_SENTENCES) {
+                        long t0 = System.currentTimeMillis();
+                        String out = engine.translate(s, "eng_Latn", tgt);
+                        total += System.currentTimeMillis() - t0;
+                        if (out != null) repChars += out.length();
+                    }
+                    long run = total / MT_SENTENCES.length;
+                    // 字数只跟着最快那一轮记：两轮一起累加会把 ms/字 算少一半
+                    if (run < bestRun) {
+                        bestRun = run;
+                        bestChars = repChars;
+                    }
+                }
+                // 汉字约一个 spm token 一到两个字符，这里用「ms/字」当带宽受限的代理指标：
+                // 它基本不随句长变化，能直接拿不同模型的每步成本对比
+                double perChar = bestChars > 0
+                        ? (double) bestRun * MT_SENTENCES.length / bestChars : 0;
+                report.append(String.format(Locale.getDefault(),
+                        "  %d 线程: %dms/句（%.1fms/字）%n", th, bestRun, perChar));
+                if (bestRun > 0 && bestRun < bestMs) {
+                    bestMs = bestRun;
+                    bestThreads = th;
+                }
+            }
+        } catch (Throwable t) {
+            report.append("翻译基准中断: ").append(t.getMessage()).append('\n');
+            return -1;
+        } finally {
+            engine.destroy();
+        }
+        return bestThreads;
     }
 
     private void showReport(String text) {

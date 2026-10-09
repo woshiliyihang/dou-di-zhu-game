@@ -1,0 +1,28 @@
+# 交叉编译脚本要在 Linux/云端跑。CRLF 会让 bash 把每行读成 "foo\r"，命令名直接对不上，
+# 二十分钟的编译连开始都开始不了。这台机器的 git 是 core.autocrlf=true，
+# 不写下面这条，下次 checkout 又全给转回来。
+*.sh              text eol=lf
+*.py              text eol=lf
+*.c               text eol=lf
+*.h               text eol=lf
+*.cpp             text eol=lf
+CMakeLists.txt    text eol=lf
+*.cmake           text eol=lf
+*.yml             text eol=lf
+
+# Windows 侧的入口脚本反过来要 CRLF，不然双击跑不起来
+*.bat             text eol=crlf
+*.cmd             text eol=crlf
+*.ps1             text eol=crlf
+
+# 模型和库文件绝不能被当文本处理：换行转换会直接损坏二进制
+*.onnx            binary
+*.bin             binary
+*.model           binary
+*.spm             binary
+*.jar             binary
+*.so              binary
+*.a               binary
+*.wav             binary
+*.apk             binary
+*.zip             binary

@@ -77,6 +77,16 @@ public final class SentenceSplitter {
         return pending.length();
     }
 
+    /** 还没成句的残留原文，调用方用它判断"是不是纯语气词，不值得翻" */
+    public String pendingText() {
+        return pending.toString();
+    }
+
+    /** 直接丢掉残留：一声"嗯"翻出来要花 0.7 秒，是延迟里最没价值的部分 */
+    public void dropPending() {
+        pending.setLength(0);
+    }
+
     public boolean tooShort() {
         return pending.length() < MIN_LEN;
     }

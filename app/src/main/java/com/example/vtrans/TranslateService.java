@@ -27,6 +27,7 @@ import com.example.vtrans.model.ModelsManifest;
 import com.example.vtrans.pipeline.AsrEngine;
 import com.example.vtrans.pipeline.MtEngine;
 import com.example.vtrans.pipeline.SentenceSplitter;
+import com.example.vtrans.pipeline.StreamingAsr;
 import com.example.vtrans.pipeline.VadSegmenter;
 import com.example.vtrans.util.Prefs;
 import com.example.vtrans.util.Stats;
@@ -34,6 +35,7 @@ import com.example.vtrans.util.WaveReader;
 
 import java.io.File;
 import java.util.ArrayDeque;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Locale;
@@ -93,7 +95,19 @@ public class TranslateService extends Service {
     private VadSegmenter vad;
     private AsrEngine asr;
     private MtEngine mt;
+    /**
+     * 当前翻译引擎是语对专用模型（只认英→中）。它没有语言码体系，喂中文进去
+     * 不会报错、只会很自信地输出一串胡话，所以调用方要靠它把中文句子拦下来。
+     */
+    private volatile boolean pairMt;
     private TtsSpeaker tts;
+
+    /**
+     * 流式识别引擎。非 null 时它就是主识别器：音频只喂 {@link #feedStreaming}，
+     * VAD/SenseVoice 那一路不再喂数据——它只在流式模型缺失或加载失败时才接手。
+     */
+    private StreamingAsr streaming;
+    private ExecutorService streamExec;
 
     private ExecutorService asrExec;
     private ExecutorService mtExec;
@@ -108,10 +122,13 @@ public class TranslateService extends Service {
      */
     private final AtomicInteger finalQueued = new AtomicInteger(0);
 
-    /** 碎句攒着等拼接的兜底：距上一段太近且尾巴太短就先不翻（见 maybeFlushTail） */
-    private static final int TAIL_KEEP_MIN_CHARS = 6;
-    /** 攒着的碎句最多等多久，到点必须吐出去，免得用户不说了译文就永远不来 */
-    private static final long TAIL_FLUSH_DELAY_MS = 1200;
+    /**
+     * 残句长到这个程度就立刻翻，别再等拼接：等拼接换回来的是句子更连贯，
+     * 代价是用户干等着，速度优先时不划算。
+     */
+    private static final int TAIL_KEEP_MIN_CHARS = 4;
+    /** 攒着的碎句最多等多久。原来 1.2s，实测那 1.2s 是全链路里最没道理的一段 */
+    private static final long TAIL_FLUSH_DELAY_MS = 400;
     private volatile long lastSegmentAtMs;
     private volatile String lastSegLang;
 
@@ -127,6 +144,18 @@ public class TranslateService extends Service {
     private static final int MAX_PENDING_SEGMENTS = 6;
     private final Object pendingLock = new Object();
     private final ArrayDeque<float[]> pendingSegments = new ArrayDeque<>();
+    /** 就绪前抵达的音频帧（每帧 20ms），攒够 12s 才丢最早的：首启还要多赶一次解包 */
+    private static final int MAX_PENDING_FRAMES = 600;
+    private final ArrayDeque<float[]> pendingFrames = new ArrayDeque<>();
+    /** 本轮打算用流式识别（模型存在但还在解包/加载）：帧先攒着，不要交 VAD 处理 */
+    private volatile boolean streamingIntended;
+    /** 解码跟不上实时时的丢帧阈值：落后 0.5s 继续攒只会让延迟无限增长 */
+    private static final int STREAM_MAX_BACKLOG = 25;
+    private final AtomicInteger streamBacklog = new AtomicInteger(0);
+    /** 因积压丢掉的帧数（诊断用） */
+    private final AtomicInteger streamDrops = new AtomicInteger(0);
+    /** 录音线程收到的帧计数（只在该线程读写，不需同步） */
+    private int audioFrames;
     /** 引擎就绪且 warmup 完成才置真；此前提交的段一律入队而不是丢弃 */
     private volatile boolean enginesReady;
 
@@ -366,13 +395,24 @@ public class TranslateService extends Service {
 
     private void loadEngines(String provider) {
         int threads = prefs.mtThreads();
-        mt = MtEngine.create(models.nllbDir().getAbsolutePath(), threads, prefs.beamForTier());
+        File mtDir = models.mtDir();
+        mt = MtEngine.create(mtDir.getAbsolutePath(), threads, prefs.beamForTier());
+        if (mt == null && !mtDir.equals(models.nllbDir())) {
+            // 语对专用模型（OPUS-MT）没有 NLLB 那套语言码体系，得新版 native 才认。
+            // 旧 libvtrans-mt.so 只找 sentencepiece.bpe.model，读它就返回 null ——
+            // 这时退回 NLLB：照常能用，只是每 token 仍是 45ms 那个量级。
+            Log.w(TAG, "翻译模型 " + mtDir.getName() + " 加载失败（libvtrans-mt.so 该重编了），退回 NLLB");
+            mtDir = models.nllbDir();
+            mt = MtEngine.create(mtDir.getAbsolutePath(), threads, prefs.beamForTier());
+        }
         if (mt == null) {
             // mt_engine 的 lastError 没走 JNI 暴露，native 侧的原因看不到，
             // 所以把模型目录打出来：少文件 / 文件不全是最常见的原因
-            Log.e(TAG, "NLLB 加载失败，目录内容：" + describeDir(models.nllbDir()));
-            throw new IllegalStateException("NLLB 模型加载失败（" + models.nllbDir() + "）");
+            Log.e(TAG, "翻译模型加载失败，目录内容：" + describeDir(mtDir));
+            throw new IllegalStateException("翻译模型加载失败（" + mtDir + "）");
         }
+        Log.i(TAG, "翻译模型: " + mtDir.getName() + "，" + threads + " 线程");
+        pairMt = !mtDir.equals(models.nllbDir());
         asr = AsrEngine.create(models, provider, Math.min(2, threads), prefs.sourceLang());
 
         // 提前把 Whisper 载好：高精档、或用户明确选了非中/粤语种时这句一定会用到。
@@ -382,6 +422,158 @@ public class TranslateService extends Service {
                 || (!"auto".equals(src) && !isZhish(src));
         if (eagerWhisper && models.isReady(ModelsManifest.WHISPER) && !asr.hasWhisper()) {
             asr.switchWhisperLang(models, provider, Math.min(2, threads), src);
+        }
+
+        // 流式优先：装了英文流式模型就把它当主识别器。provider 一律给 cpu：
+        // chunk 化的 zipformer 在 NNAPI/XNNPACK 上算子回退很多，并不比 cpu 稳。
+        // 预热必须在把 streaming 发布出去之前做：那一刻起音频帧才会开始并发改这个流。
+        if (streamingIntended) {
+            unpackIfNeeded(ModelsManifest.ZIPFORMER_EN);
+            StreamingAsr s = StreamingAsr.create(models, "cpu", Math.min(2, threads));
+            if (s == null) {
+                streamingIntended = false;
+                Log.w(TAG, "流式模型存在但加载失败，本轮退回 SenseVoice");
+            } else {
+                warmUpStreaming(s);
+                streamExec = Executors.newSingleThreadExecutor(
+                        r -> new Thread(r, "vtrans-stream"));
+                // 先把加载期间攒下的帧按序入队，再发布 streaming：反过来写就会
+                // 出现新帧排在旧帧前面，流式解码按到达顺序累计特征，顺序乱了字就乱。
+                drainPendingFrames(s);
+                streaming = s;
+            }
+        }
+    }
+
+    /**
+     * 模型已经随 APK 装进手机，但还要从 APK 拷到可读写的目录才能加载。
+     * 这一步原来要人去设置页点「解包」——说话前先做一次手动配置没道理，
+     * 所以引擎加载前顺手拷掉（70MB 约 1 秒，期间音频帧已经攒在 pendingFrames 里）。
+     */
+    private void unpackIfNeeded(ModelsManifest.Model m) {
+        if (models.isReady(m)) return;
+        long t0 = System.currentTimeMillis();
+        try {
+            models.ensure(m, null);
+            Log.i(TAG, m.label + " 已自动解包，耗时 "
+                    + (System.currentTimeMillis() - t0) + "ms");
+        } catch (Throwable t) {
+            // 空间不够 / 拷贝中断都不能把整条链路带崩：没它照样能翻译，只是回到旧时序
+            Log.w(TAG, m.label + " 自动解包失败，本轮不用它: " + t.getMessage());
+        }
+    }
+
+    /** 拿随包的英文音频过一遍图：sherpa 首次 run 要做图优化与内存分配，明显更慢 */
+    private void warmUpStreaming(StreamingAsr s) {
+        long t0 = System.currentTimeMillis();
+        try {
+            float[] wav = WaveReader.read(this, "bench_en.wav");
+            s.warmUp(wav, 320);
+            Log.i(TAG, "流式预热完成，耗时 " + (System.currentTimeMillis() - t0) + "ms");
+        } catch (Throwable t) {
+            Log.i(TAG, "流式预热跳过（不影响使用）: " + t.getMessage());
+        }
+    }
+
+    /** 增量文本上屏节流：文字没变不广播，变了也最多每 250ms 一次（只 streamExec 线程读写） */
+    private static final long PARTIAL_MIN_BROADCAST_MS = 250;
+    private String lastStreamPartial = "";
+    private long lastStreamPartialAtMs;
+
+    /**
+     * 把一帧音频交给流式解码线程。
+     *
+     * <p>录音线程只做拷贝与排队：一次 decode 要几毫秒到十几毫秒，压在 20ms 一帧
+     * 的节拍上会把音频线程拖慢，接下来就是系统丢帧——那是整条链路最难查的故障。
+     */
+    private void feedStreaming(float[] frame, int len) {
+        final StreamingAsr s = streaming;
+        if (s == null) return;
+        // AudioCapture 的帧缓冲是复用的，交给另一条线程前必须自己取一份
+        queueFrame(s, Arrays.copyOf(frame, len));
+    }
+
+    private void queueFrame(final StreamingAsr engine, final float[] copy) {
+        if (streamBacklog.get() > STREAM_MAX_BACKLOG) {
+            // 本类日志全走同一条线程、内容完全一致，刷屏会被 logcat 的 chatty
+            // 折叠掉（上一轮就是这样：实际丢了几百帧，文件里只留下 4 行）。
+            // 所以改成每 50 帧报一次累计数。
+            int n = streamDrops.incrementAndGet();
+            if (n % 50 == 1) {
+                Log.w(TAG, "流式队列积压，丢弃本帧（累计丢 " + n + " 帧，backlog="
+                        + streamBacklog.get() + "）");
+            }
+            return;
+        }
+        streamBacklog.incrementAndGet();
+        try {
+            streamExec.execute(() -> {
+                streamBacklog.decrementAndGet();
+                if (!running) return;
+                String sentence = engine.feed(copy);
+                if (sentence != null) {
+                    lastStreamPartial = "";
+                    onStreamSentence(sentence);
+                    return;
+                }
+                if (!engine.takePartialDirty()) return;
+                String p = engine.partialText();
+                long now = System.currentTimeMillis();
+                if (p.isEmpty() || p.equals(lastStreamPartial)
+                        || now - lastStreamPartialAtMs < PARTIAL_MIN_BROADCAST_MS) {
+                    return;
+                }
+                lastStreamPartial = p;
+                lastStreamPartialAtMs = now;
+                broadcast("partial", p, streamLang(), 0);
+            });
+        } catch (Throwable t) {
+            streamBacklog.decrementAndGet();
+        }
+    }
+
+    /** 流式方向的源语言：设置里锁死了就用设置值，auto 那么本轮就是英文 */
+    private String streamLang() {
+        String setting = prefs.sourceLang();
+        if (setting != null && !"auto".equals(setting)) return setting;
+        return "eng_Latn";
+    }
+
+    /**
+     * 流式的一句说完。注意这里<b>没有识别耗时</b>：那句话是跟着话音一点点点缀出来的，
+     * endpoint 命中的时候已经算完了，体感延迟从此只剩「判停确认 + 翻译」。
+     */
+    private void onStreamSentence(String text) {
+        String srcLang = streamLang();
+        // 语种按书写系统再判一次：万一用户中途改口说中文，detectLang 会给出 zho，
+        // 交给 NLLB 的编码才对得上（流式英文模型硬把中文念成空白时也走这里）。
+        String detected = MtEngine.detectLang(text);
+        if ("auto".equals(prefs.sourceLang()) && detected != null) srcLang = detected;
+
+        Log.i(TAG, String.format(Locale.ROOT, "定稿(流式): %s", abbrev(text)));
+        broadcast("final", text, srcLang, 0);
+        enqueueTranslation(splitter.push(text), srcLang);
+        handleTail(srcLang);
+    }
+
+    private void holdPendingFrame(float[] frame, int len) {
+        synchronized (pendingLock) {
+            if (pendingFrames.size() >= MAX_PENDING_FRAMES) pendingFrames.pollFirst();
+            pendingFrames.addLast(Arrays.copyOf(frame, len));
+        }
+    }
+
+    /** 引擎就绪：把加载期间攒下的帧按原顺序补喂，首句不丢也不走错路 */
+    private void drainPendingFrames(StreamingAsr engine) {
+        float[] f;
+        while ((f = pollPendingFrame()) != null) {
+            queueFrame(engine, f);
+        }
+    }
+
+    private float[] pollPendingFrame() {
+        synchronized (pendingLock) {
+            return pendingFrames.pollFirst();
         }
     }
 
@@ -407,6 +599,11 @@ public class TranslateService extends Service {
     }
 
     private void startCaptureLocked(String provider) {
+        // 流式模型在不在，录音一开始就该知道：引擎还要加载 1~5s（首启还要多一次解包），
+        // 这段时间抵达的帧必须攒起来而不是交给 VAD，否则第一句会走错那条路子。
+        // 只查 isReady 不够：刚装完 APK 时模型在包里还没拷出来，那时候也该走流式。
+        streamingIntended = models.isReady(ModelsManifest.ZIPFORMER_EN)
+                || models.hasAsset(ModelsManifest.ZIPFORMER_EN);
         vad = new VadSegmenter(models.vadFile().getAbsolutePath(), 1, "cpu",
                 new VadSegmenter.Callback() {
                     @Override
@@ -424,6 +621,23 @@ public class TranslateService extends Service {
         capture = new AudioCapture(this, effectiveAudioMode(), new AudioCapture.Sink() {
             @Override
             public void onFrame(float[] vadFrame, float[] asrFrame, int len) {
+                // 心跳：每 100 帧报一次。这一行能直接分清三件事——帧到底有没有
+                // 进来、一帧实际多长、以及它是递给流式还是攒进 pending。
+                if ((++audioFrames % 100) == 0) {
+                    Log.i(TAG, "帧#" + audioFrames + " len=" + len
+                            + "（" + (len * 1000L / 16000) + "ms） streaming="
+                            + (streaming != null) + " intended=" + streamingIntended
+                            + " backlog=" + streamBacklog.get());
+                }
+                if (streaming != null) {
+                    feedStreaming(asrFrame, len);
+                    return;
+                }
+                if (streamingIntended) {
+                    // 流式引擎还在路上：帧先存着，就绪后按原顺序补喂，第一句不丢
+                    holdPendingFrame(asrFrame, len);
+                    return;
+                }
                 // 门控路只喂 VAD，无门控路进识别缓冲 —— 两者在 VadSegmenter 里分流
                 if (vad != null) vad.feed(vadFrame, asrFrame);
             }
@@ -481,6 +695,8 @@ public class TranslateService extends Service {
         if (!running || !prefs.partialsEnabled() || vad == null) return;
         // 模型还没装好就别抢 asrExec（那段时间在排队的是攒下来的真音频）
         if (!enginesReady) return;
+        // 流式引擎在跑：它自己就提供增量文本，这套定时整段重跑既多余又会抢核
+        if (streaming != null) return;
         // 有定稿在跑或排队：这一拍预览直接跳过。预览晚一拍没人看得出，
         // 定稿晚一拍就是「说完话干等」。
         if (finalQueued.get() > 0) return;
@@ -518,6 +734,9 @@ public class TranslateService extends Service {
 
     /** 一句话说完：最终识别 + 切句 + 翻译 */
     private void submitFinal(float[] samples) {
+        // 流式引擎在跑：句边界由 endpoint 判，这一路不再产生段（正常走不到这里，
+        // 留着是防 shutdown/restart 交错时两个引擎同时上屏同一句）
+        if (streaming != null) return;
         // 模型还在加载：攒起来，等 drainPendingSegments() 按序补跑，而不是把这句话丢掉
         if (!enginesReady) {
             holdPendingSegment(samples);
@@ -597,34 +816,39 @@ public class TranslateService extends Service {
                                 queueMs, svMs, whMs));
                 broadcast("final", text, srcLang, asrMs);
 
-                List<String> sentences = splitter.push(text);
-                if (sentences != null) {
-                    for (String s : sentences) {
-                        enqueueTranslation(s, srcLang);
-                    }
-                }
+                // 一次定稿切出多句时合并成一次解码调用（见 enqueueTranslation）
+                enqueueTranslation(splitter.push(text), srcLang);
             } catch (Throwable t) {
                 Log.e(TAG, "最终识别失败", t);
             } finally {
                 finalQueued.decrementAndGet();
-                // VAD 现在 0.32s 就判停，句间停顿很可能被切成两段。这里的策略：
-                // 残留够长（≥6 字）就马上翻，用户在等；太短（"那个"、"就是"这种）
-                // 先攒着，下一段来了拼成整句再翻——但最多攒 1.2s，到点必须吐出去。
-                if (srcLang != null) {
-                    lastSegLang = srcLang;
-                    int tail = splitter.pendingLength();
-                    if (tail >= TAIL_KEEP_MIN_CHARS) {
-                        flushSplitter(srcLang);
-                    } else if (tail > 0) {
-                        mainHandler.postDelayed(tailFlushGuard, TAIL_FLUSH_DELAY_MS);
-                    }
-                }
+                handleTail(srcLang);
             }
             });
         } catch (Throwable t) {
             // executor 已 shutdown：忽略排队失败
             finalQueued.decrementAndGet();
             Log.w(TAG, "最终识别任务提交失败", t);
+        }
+    }
+
+    /**
+     * 残句处理（整段与流式两条路共用）：纯语气词直接丢，够长就马上翻，
+     * 太短只等 0.4s——速度优先，宁可句子拼得短一点，也别让用户干等。
+     */
+    private void handleTail(String srcLang) {
+        if (srcLang == null) return;
+        lastSegLang = srcLang;
+        String tailText = splitter.pendingText().trim();
+        if (!tailText.isEmpty() && isPureFiller(tailText)) {
+            splitter.dropPending();
+            return;
+        }
+        int tail = splitter.pendingLength();
+        if (tail >= TAIL_KEEP_MIN_CHARS) {
+            flushSplitter(srcLang);
+        } else if (tail > 0) {
+            mainHandler.postDelayed(tailFlushGuard, TAIL_FLUSH_DELAY_MS);
         }
     }
 
@@ -650,12 +874,7 @@ public class TranslateService extends Service {
 
     /** 把切句器里攒下的残句全部送去翻译（识别线程调用） */
     private void flushSplitter(String lang) {
-        List<String> rest = splitter.flush();
-        if (rest != null) {
-            for (String s : rest) {
-                enqueueTranslation(s, lang);
-            }
-        }
+        enqueueTranslation(splitter.flush(), lang);
     }
 
     /** 低于这个峰值（≈ -40dBFS）的定稿段当作“基本只有底噪”，不值得花 Whisper 重跑 */
@@ -703,25 +922,59 @@ public class TranslateService extends Service {
                 || v.startsWith("zho") || v.startsWith("cmn");
     }
 
-    private void enqueueTranslation(String sentence, String srcLang) {
+    /**
+     * 把一批句子交给翻译线程。
+     *
+     * <p>多句合并成一次 {@code translateBatch}：CTranslate2 的批量解码把若干次
+     * GEMV 合成一次 GEMM，两句的总时间远小于「串行翻两遍」（实测每句 ~0.85s，
+     * 批下来接近 1.1s 而不是 1.7s）。单句仍走原路径，不为凑批让首句多等。
+     *
+     * <p>纯语气词在这一步再筛一次：识别结果里的「嗯。」「oh.」带终止符，
+     * 会直接从 push() 出句，绕过 submitFinal 末尾那道残句过滤。
+     */
+    private void enqueueTranslation(List<String> sentences, String srcLang) {
+        if (sentences == null || sentences.isEmpty()) return;
         final MtEngine engine = mt;
         if (engine == null) return;
+        if (pairMt && isZhish(srcLang)) {
+            // 语对专用模型只认英→中：中文喂进去不报错，只会产出看着像模像样的胡话。
+            // 宁可把原文当译文上屏（中途改口说中文、或误检成中文时就是这种情形）。
+            for (String s : sentences) {
+                if (s != null && !s.trim().isEmpty()) broadcast("translation", s, srcLang, 0);
+            }
+            return;
+        }
+        List<String> batch = null;
+        for (String s : sentences) {
+            if (s == null || s.trim().isEmpty() || isPureFiller(s)) continue;
+            if (batch == null) batch = new ArrayList<>(sentences.size());
+            batch.add(s);
+        }
+        if (batch == null) return;
+        final List<String> todo = batch;
+        final String[] texts = todo.toArray(new String[0]);
         try {
             mtExec.execute(() -> {
                 long t0 = System.currentTimeMillis();
-                String out = null;
+                String[] outs = null;
                 try {
-                    out = engine.translate(sentence, srcLang, prefs.targetLang());
+                    outs = texts.length == 1
+                            ? new String[]{engine.translate(texts[0], srcLang, prefs.targetLang())}
+                            : engine.translateBatch(texts, srcLang, prefs.targetLang());
                 } catch (Throwable t) {
                     Log.e(TAG, "翻译失败", t);
                 }
                 long ms = System.currentTimeMillis() - t0;
-                mtStats.add(ms);
+                // 批量时按句摊平再进统计：PerfGuard 的基线要表示"每句成本"才有意义
+                mtStats.add(ms / texts.length);
                 // 翻译这一环的耗时（含排队）单独记一条：它和识别是分开的两个线程
-                Log.i(TAG, String.format(Locale.ROOT, "译文: %dms %d字 level=%d ← %s",
-                        ms, sentence.length(), degradeLevel.get(),
-                        sentence.length() > 18 ? sentence.substring(0, 18) + "…" : sentence));
-                if (out != null && !out.trim().isEmpty()) {
+                Log.i(TAG, String.format(Locale.ROOT, "译文: %dms %d句%d字 level=%d ← %s",
+                        ms, texts.length, srcChars(todo), degradeLevel.get(),
+                        abbrev(texts[0])));
+                if (outs == null) return;
+                for (int i = 0; i < outs.length && i < texts.length; i++) {
+                    String out = outs[i];
+                    if (out == null || out.trim().isEmpty()) continue;
                     broadcast("translation", out, prefs.targetLang(), ms);
                     speakTranslation(out, prefs.targetLang());
                 }
@@ -733,6 +986,43 @@ public class TranslateService extends Service {
             Log.w(TAG, "翻译任务提交失败", t);
         }
     }
+
+    private static String abbrev(String s) {
+        if (s == null) return "";
+        return s.length() > 18 ? s.substring(0, 18) + "…" : s;
+    }
+
+    private static int srcChars(List<String> sentences) {
+        int n = 0;
+        for (String s : sentences) n += s.length();
+        return n;
+    }
+
+    /**
+     * 是不是纯语气词。先去标点再比长度：「嗯。」「oh.」这种带终止符的碎片会
+     * 直接从切句器出句，绕不过这里。只认「短到不承载信息」的片段——汉字一到
+     * 两个、拉丁词只认表里那几个，再长就当内容有值，宁翻不误删。
+     */
+    private static boolean isPureFiller(String s) {
+        if (s == null) return false;
+        StringBuilder sb = new StringBuilder(s.length());
+        for (int i = 0; i < s.length(); i++) {
+            char c = s.charAt(i);
+            if (Character.isLetterOrDigit(c)) sb.append(Character.toLowerCase(c));
+        }
+        String word = sb.toString();
+        if (word.isEmpty() || word.length() > 3) return false;
+        if (FILLER_LATIN.contains(word)) return true;
+        if (word.length() > 2) return false;
+        for (int i = 0; i < word.length(); i++) {
+            if (FILLER_ZH.indexOf(word.charAt(i)) < 0) return false;
+        }
+        return true;
+    }
+
+    private static final java.util.Set<String> FILLER_LATIN = new java.util.HashSet<>(
+            Arrays.asList("uh", "um", "oh", "ah", "er", "mm", "eh", "hmm"));
+    private static final String FILLER_ZH = "嗯哦啊呃呢哈呀噢唔嘞嘛哎咳唔";
 
     /** 译文语音播报；是否出声由「仅耳机播报」开关决定（见 TtsSpeaker） */
     private void speakTranslation(String text, String targetLang) {
@@ -967,6 +1257,23 @@ public class TranslateService extends Service {
         //    关键点：**立刻把字段置空、取好局部引用**，释放动作才排到各单线程队列队尾。
         //    这样即使服务迅速重启、字段被新引擎占用，旧引擎也只被自己的释放任务释放，
         //    不会出现「排队任务执行时读到新引擎引用而误释放」。
+        // 2.5) 流式引擎：先把字段置空（录音线程据此停止投递新帧），排干 streamExec
+        //      队列后再释放 native 流——顺序错了就是 use-after-free。
+        StreamingAsr oldStreaming = streaming;
+        streaming = null;
+        streamingIntended = false;
+        streamBacklog.set(0);
+        synchronized (pendingLock) {
+            pendingFrames.clear();
+            pendingSegments.clear();
+        }
+        if (streamExec != null) {
+            streamExec.shutdown();
+            awaitTermination(streamExec, 800);
+            streamExec = null;
+        }
+        if (oldStreaming != null) oldStreaming.release();
+
         AsrEngine oldAsr = asr;
         asr = null;
         if (asrExec != null) {

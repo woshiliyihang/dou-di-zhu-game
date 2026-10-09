@@ -52,8 +52,35 @@ public final class ModelsManifest {
             "nllb_vocab", "NLLB 词表", true,
             "nllb/shared_vocabulary.txt");
 
+    // ---- 流式英文 Zipformer (int8)：英→中方向的主识别器，可选 ----
+    // 与 SenseVoice 的整段识别不同：边说边出字，句子边界由 endpoint 规则判。
+    // 好处不是“算得更快”，而是“说话的那段时间已经在算了”——说完之后
+    // 几乎不需要再等识别，判停等待和整段重跑一起消失。
+    public static final Model ZIPFORMER_EN = new Model(
+            "zipformer-en", "Streaming Zipformer EN (int8)", false,
+            "zipformer-en/encoder-epoch-99-avg-1-chunk-16-left-128.int8.onnx",
+            "zipformer-en/decoder-epoch-99-avg-1-chunk-16-left-128.onnx",
+            "zipformer-en/joiner-epoch-99-avg-1-chunk-16-left-128.int8.onnx",
+            "zipformer-en/tokens.txt");
+
+    // ---- OPUS-MT en→zh（CTranslate2）：约 60~120MB，可选，只做英→中时拿它替掉 NLLB ----
+    // CT2 解码是内存带宽受限的：每生成一个 token 都要把整个权重读一遍。
+    // NLLB-600M int8 ≈600MB → 实测每 token 约 45ms；这个模型 ~60MB → 个位数 ms。
+    // 它又只在英/中这一对语言上训过，准确率不比多语模型差，代价是换对语言就没法用。
+    //
+    // 分词模型必须叫 sentencepiece.model：native 侧拿「有没有 sentencepiece.bpe.model」
+    // 当作「要不要加 NLLB 语言码前缀」的判据。下完还要重编 libvtrans-mt.so
+    // （见 tools/fetch_models.sh 的输出提示），旧 .so 加载它会失败并自动退回 NLLB。
+    public static final Model OPUS_MT_EN_ZH = new Model(
+            "opus_mt_en_zh", "OPUS-MT en→zh (CT2)", false,
+            "opus-mt-en-zh/model.bin",
+            "opus-mt-en-zh/config.json",
+            "opus-mt-en-zh/sentencepiece.model",
+            "opus-mt-en-zh/vocabulary.txt");
+
     public static final Model[] ALL = {
             VAD, SENSEVOICE, NLLB_MODEL, NLLB_TOKENIZER, NLLB_VOCAB, WHISPER,
+            ZIPFORMER_EN, OPUS_MT_EN_ZH,
     };
 
     /** 启动就必须有的模型（Whisper 是可选的） */

@@ -63,6 +63,27 @@ public class ModelManager {
         return new File(modelsDir, "nllb");
     }
 
+    /** 英→中专用翻译模型的 CTranslate2 目录 */
+    public File mtEnZhDir() {
+        return new File(modelsDir, "opus-mt-en-zh");
+    }
+
+    /**
+     * 翻译引擎该从哪个目录读。装了语对专用模型就用它（权重只有 NLLB 的十分之一，
+     * 解码是带宽受限的，因而能快好几倍），否则用 NLLB。
+     *
+     * <p>只按「三个必需文件齐不齐」判，不走 {@code isReady(OPUS_MT_EN_ZH)}：
+     * 词表文件只给人看，native 不读它，不该因为缺它就放弃一个好模型。
+     */
+    public File mtDir() {
+        File d = mtEnZhDir();
+        boolean usable = new File(d, "model.bin").isFile()
+                && new File(d, "config.json").isFile()
+                && (new File(d, "sentencepiece.model").isFile()
+                    || new File(d, "source.spm").isFile());
+        return usable ? d : nllbDir();
+    }
+
     public File vadFile() {
         return resolve(ModelsManifest.VAD.files[0]);
     }
@@ -87,6 +108,23 @@ public class ModelManager {
         return resolve(ModelsManifest.WHISPER.files[2]);
     }
 
+    // ---- 流式英文 Zipformer：encoder/decoder/joiner + tokens 四件套 ----
+    public File zipformerEncoder() {
+        return resolve(ModelsManifest.ZIPFORMER_EN.files[0]);
+    }
+
+    public File zipformerDecoder() {
+        return resolve(ModelsManifest.ZIPFORMER_EN.files[1]);
+    }
+
+    public File zipformerJoiner() {
+        return resolve(ModelsManifest.ZIPFORMER_EN.files[2]);
+    }
+
+    public File zipformerTokens() {
+        return resolve(ModelsManifest.ZIPFORMER_EN.files[3]);
+    }
+
     /** 清单里的相对路径 -> 绝对路径 */
     public File resolve(String relative) {
         return new File(modelsDir, relative);
@@ -105,6 +143,16 @@ public class ModelManager {
             if (!isReady(m)) return false;
         }
         return true;
+    }
+
+    /** APK 里是否带着这个模型（还没解包也算）。可选模型没打包是正常的。 */
+    public boolean hasAsset(ModelsManifest.Model m) {
+        try {
+            ctx.getAssets().open(ModelsManifest.ASSET_ROOT + "/" + m.files[0]).close();
+            return true;
+        } catch (IOException e) {
+            return false;
+        }
     }
 
     public List<ModelsManifest.Model> missingRequired() {

@@ -16,6 +16,21 @@
 namespace vtrans {
 namespace {
 
+// CT2 模型目录里的 sentencepiece 文件名没有统一约定：NLLB 转换器写
+// sentencepiece.bpe.model，Marian/OPUS-MT 这类语对专用模型写 sentencepiece.model
+// 或 source.spm(+target.spm)。按候选名找，别硬编码一种。
+bool fileExists(const std::string& path) {
+  std::ifstream f(path, std::ios::binary);
+  return f.good();
+}
+
+std::string firstExisting(const std::vector<std::string>& paths) {
+  for (const auto& p : paths) {
+    if (fileExists(p)) return p;
+  }
+  return std::string();
+}
+
 // 常见写法 -> NLLB 码
 const std::map<std::string, std::string>& langTable() {
   static const std::map<std::string, std::string> k = {
@@ -107,13 +122,30 @@ class MtEngineImpl : public MtEngine {
  public:
   MtEngineImpl(const std::string& model_dir, int threads, int beam)
       : model_dir_(model_dir), threads_(threads), beam_(beam) {
-    const std::string sp_path = model_dir + "/sentencepiece.bpe.model";
-    std::ifstream f(sp_path);
-    if (!f.good()) { last_error_ = "sp model not found: " + sp_path; return; }
-    f.close();
-
-    auto st = sp_.Load(sp_path);
+    const std::string nllb_sp = model_dir + "/sentencepiece.bpe.model";
+    // 「要不要加语言码前缀」用文件名存在性判：这两个约定分别由 CT2 的 nllb 与
+    // marian 转换器固定写死，够用且不会误判。语对专用模型没有语言码体系，硬塞
+    // eng_Latn 只会让它多出一个未登录词，译文跑偏。
+    nllb_style_ = fileExists(nllb_sp);
+    const std::string src_sp =
+        nllb_style_ ? nllb_sp
+                    : firstExisting({model_dir + "/sentencepiece.model",
+                                     model_dir + "/source.spm",
+                                     model_dir + "/vocab.spm", nllb_sp});
+    if (src_sp.empty()) {
+      last_error_ = "no sentencepiece model found in " + model_dir;
+      return;
+    }
+    auto st = sp_src_.Load(src_sp);
     if (!st.ok()) { last_error_ = "sp load failed: " + st.ToString(); return; }
+
+    // 少数语对模型（M2M100 那类）源/目标各一份 spm；没有 target.spm 就共用源那份
+    const std::string tgt_sp = model_dir + "/target.spm";
+    if (!nllb_style_ && fileExists(tgt_sp)) {
+      auto st2 = sp_tgt_.Load(tgt_sp);
+      if (!st2.ok()) { last_error_ = "tgt sp load failed: " + st2.ToString(); return; }
+      decode_with_tgt_ = true;
+    }
     if (!buildTranslator()) return;
     ready_ = true;
   }
@@ -154,18 +186,22 @@ class MtEngineImpl : public MtEngine {
     std::vector<std::vector<std::string>> source;
     std::vector<std::vector<std::string>> prefix;
     source.reserve(texts.size());
+    prefix.reserve(texts.size());
     for (const auto& t : texts) {
       std::vector<std::string> toks;
-      toks.push_back(src);
+      if (nllb_style_) toks.push_back(src);  // 多语模型靠这个前缀认源语言
       std::vector<std::string> pieces;
       {
         std::lock_guard<std::mutex> lk(sp_mu_);
-        pieces = sp_.EncodeAsPieces(t);
+        pieces = sp_src_.EncodeAsPieces(t);
       }
       toks.insert(toks.end(), pieces.begin(), pieces.end());
       toks.push_back("</s>");
       source.push_back(std::move(toks));
-      prefix.push_back({tgt});
+      // CT2 要求 prefix 与 batch 等长，所以语对模型给每句一个「空 prefix」；
+      // 整个 prefix 留空会被判成 size mismatch 直接抛异常。
+      prefix.emplace_back(nllb_style_ ? std::vector<std::string>{tgt}
+                                      : std::vector<std::string>{});
     }
 
     ctranslate2::TranslationOptions opt;
@@ -191,11 +227,11 @@ class MtEngineImpl : public MtEngine {
       if (r.hypotheses.empty()) { outs.emplace_back(); continue; }
       auto& hyp = r.hypotheses[0];
       // 去掉开头的目标语言码与结尾的 </s>
-      if (!hyp.empty() && hyp[0] == tgt) hyp.erase(hyp.begin());
+      if (nllb_style_ && !hyp.empty() && hyp[0] == tgt) hyp.erase(hyp.begin());
       while (!hyp.empty() && (hyp.back() == "</s>" || hyp.back() == "<pad>")) hyp.pop_back();
       std::lock_guard<std::mutex> lk(sp_mu_);
       std::string text_out;
-      sp_.Decode(hyp, &text_out);
+      (decode_with_tgt_ ? sp_tgt_ : sp_src_).Decode(hyp, &text_out);
       outs.push_back(text_out);
     }
     return true;
@@ -216,7 +252,10 @@ class MtEngineImpl : public MtEngine {
   int beam_;
   bool ready_ = false;
   std::string last_error_;
-  sentencepiece::SentencePieceProcessor sp_;
+  bool nllb_style_ = true;   // 模型是否使用 NLLB 的语言码体系
+  bool decode_with_tgt_ = false;
+  sentencepiece::SentencePieceProcessor sp_src_;
+  sentencepiece::SentencePieceProcessor sp_tgt_;
   std::mutex sp_mu_;
   std::unique_ptr<ctranslate2::Translator> translator_;
 };
