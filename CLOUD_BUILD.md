@@ -202,11 +202,17 @@ Abort message: 'terminating due to uncaught exception of type
 
 ### 你要做的
 
+脚本与任务书一律以 **master** 为准（上一轮的 `native-build` 分支里那个 `.so` 是会崩的废品，
+不要再去那里拉代码）：
+
 ```bash
 git fetch origin
-git checkout -B native-build origin/native-build   # 分支会被委托人重写，用 -B 硬对齐，不要 merge
+git checkout -B master origin/master      # 硬对齐远端 master，不要 merge
 bash native/cloud_build.sh
 ```
+
+编完把产物推到 `native-build` 分支（见本节末尾），**不要推 master**：委托人从 master 取脚本、
+从 native-build 取 `.so`，两条线分开才不会互相踩。
 
 不要自己重写构建流程，也不要“顺手优化”那几个 cmake 开关。
 
