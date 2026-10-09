@@ -26,10 +26,11 @@ Set-Location $repo
 $numFile = Join-Path $repo ".buildnum"
 $n = 0
 if (Test-Path $numFile) { $n = [int](Get-Content $numFile -Raw).Trim() }
-$n++
+$clockBuildNo = [long][DateTimeOffset]::UtcNow.ToUnixTimeSeconds() - 1577836800
+$n = [Math]::Max($clockBuildNo, $n + 1)
 
 $appkDir = Join-Path $repo "app\build\outputs\apk\debug"
-$apk = Join-Path $appkDir "app-debug.apk"
+$apk = Join-Path $appkDir ("vtrans-debug-b{0}.apk" -f $n)
 
 Write-Host ("=== build b{0} (versionName 1.0.0-b{0}, versionCode {1}) ===" -f $n, (10000 + $n))
 
@@ -50,10 +51,7 @@ finally {
 
 if (-not (Test-Path $apk)) { throw "APK not produced: $apk" }
 
-# Keep a numbered copy, otherwise every round overwrites the same file name and
-# there is no way back to "which one did I actually install".
-$named = Join-Path $appkDir ("vtrans-b{0}.apk" -f $n)
-Copy-Item $apk $named -Force
+$named = $apk
 
 $sizeMB = [math]::Round((Get-Item $named).Length / 1MB, 1)
 $md5Local = (Get-FileHash $named -Algorithm MD5).Hash.ToLower()
@@ -72,7 +70,7 @@ Write-Host ("md5 OK  {0}" -f $md5Local)
 if ($PurgeOld) {
   # Remove our previous debug drops, nothing else. These are build artifacts,
   # not user data; the point is that a stale 900MB package must not be tappable.
-  adb shell "rm -f /sdcard/Download/vtrans-en-zh-debug.apk /sdcard/Download/vtrans-en-zh.apk /sdcard/Download/vtrans-b*.apk" 2>$null | Out-Null
+  adb shell "rm -f /sdcard/Download/vtrans-en-zh-debug.apk /sdcard/Download/vtrans-en-zh.apk /sdcard/Download/vtrans-b*.apk /sdcard/Download/vtrans-debug-b*.apk" 2>$null | Out-Null
   adb push $named $dst 2>$null | Out-Null
   if ($LASTEXITCODE -ne 0) { throw "adb re-push after purge failed" }
   $md5Dev = ((adb shell md5sum $dst 2>$null) -split '\s+')[0]
@@ -88,7 +86,7 @@ adb shell "kill `$(pidof logcat)" 2>$null | Out-Null
 adb shell "rm -f /data/local/tmp/vrun*.log" 2>$null | Out-Null
 adb logcat -c 2>$null
 $log = "/data/local/tmp/vrun$n.log"
-adb shell "nohup logcat -v threadtime -f $log -r 60000 -n 4 -s TranslateService:V StreamingAsr:V AsrEngine:V ModelManager:V sherpa-onnx:W AndroidRuntime:E DEBUG:V '*':S >/dev/null 2>&1 &" 2>$null | Out-Null
+adb shell "nohup logcat -v threadtime -f $log -r 60000 -n 4 -s VTransPerf:V TranslateService:V StreamingAsr:V AsrEngine:V ModelManager:V MainActivity:V sherpa-onnx:W AndroidRuntime:E DEBUG:V '*':S >/dev/null 2>&1 &" 2>$null | Out-Null
 
 Set-Content -Path $numFile -Value $n -NoNewline
 if ([int](Get-Content $numFile -Raw).Trim() -ne $n) { throw "build ledger not written" }

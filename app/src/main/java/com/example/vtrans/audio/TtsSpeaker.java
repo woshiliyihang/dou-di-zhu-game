@@ -2,9 +2,12 @@ package com.example.vtrans.audio;
 
 import android.content.Context;
 import android.media.AudioDeviceInfo;
+import android.media.AudioDeviceCallback;
 import android.media.AudioManager;
 import android.speech.tts.TextToSpeech;
 import android.util.Log;
+import android.os.Handler;
+import android.os.Looper;
 
 import java.util.Locale;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -12,12 +15,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 /**
  * 译文语音播报（TTS）。
  *
- * <p>是否出声由「仅耳机播报」开关（{@code Prefs.ttsHeadsetOnly}）决定：
- * <ul>
- *   <li>开启（默认）：只有检测到有线/蓝牙/USB 耳机时才朗读。外放会被本机麦克风
- *       拾取，形成「翻译 → 外放 → 再识别 → 再翻译」的回环自激，耳机可彻底避免。</li>
- *   <li>关闭：无论是否插耳机都朗读（外放场景用户自担回环风险）。</li>
- * </ul>
+ * <p>仅在检测到耳机输出设备时播报；耳机断开时立即停止正在播放的译文。
  *
  * <p>线程模型：{@link #speak} 由翻译线程调用，{@link #release()} 由服务停止线程调用；
  * 共享状态由 {@code lock} 保护，TextToSpeech 的回调在主线程。
@@ -28,6 +26,7 @@ public final class TtsSpeaker {
 
     private final Context appContext;
     private final TextToSpeech tts;
+    private final AudioManager audioManager;
     private final Object lock = new Object();
     private final AtomicInteger utteranceSeq = new AtomicInteger(0);
 
@@ -38,10 +37,31 @@ public final class TtsSpeaker {
     private String pendingText;
     private Locale pendingLocale;
     private Locale currentLocale;
+    private final AudioDeviceCallback deviceCallback = new AudioDeviceCallback() {
+        @Override
+        public void onAudioDevicesRemoved(AudioDeviceInfo[] removedDevices) {
+            if (!isHeadsetOn(appContext)) {
+                synchronized (lock) {
+                    pendingText = null;
+                    pendingLocale = null;
+                    try {
+                        tts.stop();
+                    } catch (RuntimeException e) {
+                        Log.w(TAG, "耳机断开后停止播报失败", e);
+                    }
+                }
+            }
+        }
+    };
 
     public TtsSpeaker(Context context) {
         this.appContext = context.getApplicationContext();
+        this.audioManager = (AudioManager) appContext.getSystemService(Context.AUDIO_SERVICE);
         this.tts = new TextToSpeech(appContext, this::onInit);
+        if (audioManager != null) {
+            audioManager.registerAudioDeviceCallback(deviceCallback,
+                    new Handler(Looper.getMainLooper()));
+        }
     }
 
     private void onInit(int status) {
@@ -60,7 +80,11 @@ public final class TtsSpeaker {
                 pendingLocale = null;
             }
         }
-        if (toSpeak != null) speakNow(toSpeak);
+        if (toSpeak != null) {
+            synchronized (lock) {
+                if (isHeadsetOn(appContext) && !released) speakNow(toSpeak);
+            }
+        }
     }
 
     /**
@@ -68,16 +92,16 @@ public final class TtsSpeaker {
      *
      * @param text        译文文本
      * @param targetLang  译文语种（zh / en），决定朗读口音
-     * @param headsetOnly 是否「仅耳机时播报」
      */
-    public void speak(String text, String targetLang, boolean headsetOnly) {
+    public void speak(String text, String targetLang) {
         if (text == null || text.trim().isEmpty() || released) return;
-        if (headsetOnly && !isHeadsetOn(appContext)) {
+        if (!isHeadsetOn(appContext)) {
             Log.i(TAG, "未检测到耳机，跳过播报: " + text);
             return;
         }
         Locale locale = localeOf(targetLang);
         synchronized (lock) {
+            if (released || !isHeadsetOn(appContext)) return;
             if (!ready) {
                 // 引擎还没就绪：暂存最新一句，就绪后补播（旧的一句直接丢弃，避免堆积）
                 pendingText = text;
@@ -86,8 +110,8 @@ public final class TtsSpeaker {
                 return;
             }
             applyLocaleLocked(locale);
+            speakNow(text);
         }
-        speakNow(text);
     }
 
     private void speakNow(String text) {
@@ -140,6 +164,8 @@ public final class TtsSpeaker {
             case AudioDeviceInfo.TYPE_BLUETOOTH_A2DP:
             case AudioDeviceInfo.TYPE_BLUETOOTH_SCO:
             case AudioDeviceInfo.TYPE_USB_HEADSET:
+            case AudioDeviceInfo.TYPE_HEARING_AID:
+            case AudioDeviceInfo.TYPE_BLE_HEADSET:
                 return true;
             default:
                 return false;
@@ -150,6 +176,9 @@ public final class TtsSpeaker {
     public void release() {
         released = true;
         ready = false;
+        if (audioManager != null) {
+            audioManager.unregisterAudioDeviceCallback(deviceCallback);
+        }
         synchronized (lock) {
             pendingText = null;
             pendingLocale = null;

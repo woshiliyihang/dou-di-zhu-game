@@ -38,6 +38,7 @@ import java.util.Locale;
 public final class StreamingAsr {
 
     private static final String TAG = "StreamingAsr";
+    private static final String PERF_TAG = "VTransPerf";
 
     public static final int SAMPLE_RATE = 16000;
 
@@ -92,6 +93,7 @@ public final class StreamingAsr {
     private volatile boolean partialDirty;
     /** 解码节奏自测：每帧平均花多少毫秒。帧长 20ms，超了就是跟不上实时 */
     private long decodeMsSum;
+    private long decodeMsMax;
     private int decodeCount;
     /** 距上次复位累计喂进去的样本数，只给 {@link #FIRST_DECODE_SAMPLES} 用 */
     private int samplesSinceReset;
@@ -107,7 +109,7 @@ public final class StreamingAsr {
         this.stream = stream;
     }
 
-    /** @return 引擎；模型缺失或加载失败返回 null，调用方退回整段识别 */
+    /** @return 引擎；模型缺失或加载失败返回 null，固定英中流程会报告启动错误 */
     public static StreamingAsr create(ModelManager mm, String provider, int threads) {
         if (mm == null || !mm.isReady(com.example.vtrans.model.ModelsManifest.ZIPFORMER_EN)) {
             return null;
@@ -144,10 +146,14 @@ public final class StreamingAsr {
 
             long t0 = System.currentTimeMillis();
             OnlineRecognizer r = new OnlineRecognizer(null, cfg);
+            Log.i(PERF_TAG, "stage=asr_initialize status=ok elapsed_ms="
+                    + (System.currentTimeMillis() - t0) + " provider="
+                    + (provider == null ? "cpu" : provider) + " threads=" + threads);
             Log.i(TAG, "流式识别器就绪，加载 " + (System.currentTimeMillis() - t0) + "ms");
             return new StreamingAsr(r, r.createStream(""));
         } catch (Throwable t) {
-            Log.w(TAG, "流式识别器不可用，退回整段识别", t);
+            Log.w(TAG, "流式识别器不可用，固定英中流程无法启动", t);
+            Log.e(PERF_TAG, "stage=asr_initialize status=error", t);
             return null;
         }
     }
@@ -207,13 +213,21 @@ public final class StreamingAsr {
                         + (samplesSinceReset * 1000L / SAMPLE_RATE) + "ms 音频，已解 "
                         + decodedChunks + " 个 chunk");
             }
-            decodeMsSum += System.currentTimeMillis() - d0;
+            long feedDecodeMs = System.currentTimeMillis() - d0;
+            decodeMsSum += feedDecodeMs;
+            decodeMsMax = Math.max(decodeMsMax, feedDecodeMs);
             if (++decodeCount >= 20) {
                 // 20 次就报一行：真机上一行也没等到过（先崩了），现在要的就是
                 // “单次解码多少毫秒”这个数——它直接决定节拍能往多低压。
                 Log.i(TAG, String.format(Locale.ROOT,
-                        "流式解码: 20 次平均 %.1fms（预算 20ms）", decodeMsSum / 20.0));
+                        "流式解码: 20 次平均 %.1fms，最大 %dms（预算 20ms）",
+                        decodeMsSum / 20.0, decodeMsMax));
+                Log.i(PERF_TAG, String.format(Locale.ROOT,
+                        "stage=asr_decode sample_count=20 average_ms=%.1f max_ms=%d "
+                                + "frame_budget_ms=20",
+                        decodeMsSum / 20.0, decodeMsMax));
                 decodeMsSum = 0;
+                decodeMsMax = 0;
                 decodeCount = 0;
             }
             String text = currentText();

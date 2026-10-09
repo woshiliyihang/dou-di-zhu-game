@@ -42,6 +42,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 public class MainActivity extends AppCompatActivity {
 
     private static final String TAG = "MainActivity";
+    private static final String PERF_TAG = "VTransPerf";
     private static final int REQ_PERM = 100;
 
     /** 电平条只做可视反馈，-60dBFS 当作底、0dBFS 当满格 */
@@ -263,9 +264,13 @@ public class MainActivity extends AppCompatActivity {
             try {
                 List<ModelsManifest.Model> missing = models.missingRequired();
                 final long totalBytes = models.bytesToUnpack(missing);
+                long unpackStartedAt = android.os.SystemClock.elapsedRealtime();
+                Log.i(PERF_TAG, "stage=model_unpack_start models=" + missing.size()
+                        + " bytes=" + totalBytes);
                 long[] done = {0};
 
                 for (ModelsManifest.Model m : missing) {
+                    long modelStartedAt = android.os.SystemClock.elapsedRealtime();
                     final long base = done[0];
                     // 必须先算：解包完 bytesToUnpack 就变 0 了
                     final long modelBytes = Math.max(models.bytesToUnpack(
@@ -289,8 +294,14 @@ public class MainActivity extends AppCompatActivity {
                             return isFinishing() || isDestroyed();
                         }
                     });
+                    Log.i(PERF_TAG, "stage=model_unpack status=ok model=" + m.id
+                            + " bytes=" + modelBytes + " elapsed_ms="
+                            + (android.os.SystemClock.elapsedRealtime() - modelStartedAt));
                     done[0] = base + modelBytes;
                 }
+                Log.i(PERF_TAG, "stage=model_unpack_complete status=ok bytes=" + totalBytes
+                        + " elapsed_ms="
+                        + (android.os.SystemClock.elapsedRealtime() - unpackStartedAt));
                 runOnUiThread(() -> {
                     progress.setVisibility(View.GONE);
                     setStatus(getString(R.string.unpack_done));
@@ -299,6 +310,7 @@ public class MainActivity extends AppCompatActivity {
                 });
             } catch (IOException e) {
                 Log.e(TAG, "解包模型失败", e);
+                Log.e(PERF_TAG, "stage=model_unpack status=error", e);
                 runOnUiThread(() -> {
                     progress.setVisibility(View.GONE);
                     setStatus(getString(R.string.unpack_failed, e.getMessage()));
@@ -306,6 +318,7 @@ public class MainActivity extends AppCompatActivity {
                 });
             } catch (Throwable t) {
                 Log.e(TAG, "解包模型异常", t);
+                Log.e(PERF_TAG, "stage=model_unpack status=error", t);
                 runOnUiThread(() -> {
                     progress.setVisibility(View.GONE);
                     unpacking.set(false);

@@ -19,11 +19,11 @@ import java.util.Locale;
  * 模型解包与校验。
  *
  * <p>模型随 APK 打包在 assets/models 下（未压缩，见 build.gradle 的 noCompress）。
- * 首次启动把缺失的文件从 APK 里拷到 app 私有目录，之后 sherpa-onnx 与
- * CTranslate2 都按普通文件路径加载。全程不联网。
+ * 首次启动把缺失的文件从 APK 里拷到 app 私有目录，之后由 sherpa-onnx 按普通文件路径加载。
+ * 翻译模型随 APK 打包；运行时不需要网络或 Google 服务。
  *
  * <p>注意：asset 必须是「不压缩」存储的。压缩过的 asset 在 open() 时会被整体
- * 解压进内存，622MB 的 model.bin 会直接 OOM，而且拿不到 openFd 的长度。
+ * 解压进内存，且拿不到 openFd 的长度。
  */
 public class ModelManager {
 
@@ -56,32 +56,6 @@ public class ModelManager {
 
     public File modelsDir() {
         return modelsDir;
-    }
-
-    /** 模型解包后的根目录（NLLB 的 CTranslate2 加载器要的就是这一层） */
-    public File nllbDir() {
-        return new File(modelsDir, "nllb");
-    }
-
-    /** 英→中专用翻译模型的 CTranslate2 目录 */
-    public File mtEnZhDir() {
-        return new File(modelsDir, "opus-mt-en-zh");
-    }
-
-    /**
-     * 翻译引擎该从哪个目录读。装了语对专用模型就用它（权重只有 NLLB 的十分之一，
-     * 解码是带宽受限的，因而能快好几倍），否则用 NLLB。
-     *
-     * <p>只按「三个必需文件齐不齐」判，不走 {@code isReady(OPUS_MT_EN_ZH)}：
-     * 词表文件只给人看，native 不读它，不该因为缺它就放弃一个好模型。
-     */
-    public File mtDir() {
-        File d = mtEnZhDir();
-        boolean usable = new File(d, "model.bin").isFile()
-                && new File(d, "config.json").isFile()
-                && (new File(d, "sentencepiece.model").isFile()
-                    || new File(d, "source.spm").isFile());
-        return usable ? d : nllbDir();
     }
 
     public File vadFile() {
@@ -273,7 +247,7 @@ public class ModelManager {
 
     /**
      * APK 里缺哪些必备模型文件（排查打包问题用）。
-     * 只看必备项：Whisper 是可选的，没打包是正常的。
+     * 只检查当前必需的 VAD 与英文流式识别模型。
      */
     public List<String> missingAssets() {
         List<String> out = new ArrayList<>();

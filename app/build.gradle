@@ -2,10 +2,22 @@ plugins {
     id 'com.android.application'
 }
 
-// 调试推包用 -PbuildNo=N 带递增号，不传就是 b0。这个号同时进 versionName、
-// APK 文件名和启动日志，目的只有一个：能证明手机上跑的是哪一次构建。
-// 真机吃过一次亏：测了半天的「没效果」，其实是根本没装上新包。
-def buildNo = (project.findProperty('buildNo') ?: '0') as int
+// Every build gets a monotonically increasing local number unless the push script
+// supplies its own. It appears in versionCode, versionName and the APK filename.
+def defaultBuildNo = (System.currentTimeMillis() / 1000L - 1577836800L) as long
+def buildNoProperty = project.findProperty('buildNo')
+def buildNo
+if (buildNoProperty != null) {
+    buildNo = buildNoProperty.toString().toLong()
+} else {
+    def buildNoFile = rootProject.file('.buildnum')
+    def previousBuildNo = buildNoFile.exists()
+            ? buildNoFile.getText('UTF-8').trim().toLong()
+            : 0L
+    buildNo = Math.max(defaultBuildNo, previousBuildNo + 1L)
+    buildNoFile.setText(buildNo.toString(), 'UTF-8')
+}
+def buildVersionCode = (10000L + buildNo).intValue()
 
 android {
     namespace 'com.example.vtrans'
@@ -15,15 +27,14 @@ android {
         applicationId "com.example.vtrans"
         minSdk 28
         targetSdk 35
-        versionCode 10000 + buildNo
+        versionCode buildVersionCode
         versionName "1.0.0-b" + buildNo
 
         // 只做骁龙 888（arm64）这一档设备：省掉 32 位与 x86 的 so，体积减半
         ndk {
             abiFilters "arm64-v8a"
         }
-        // NLLB(622MB) + SenseVoice(237MB) + Whisper(375MB) 同时驻留内存，
-        // 大堆能显著降低被 LMK 杀掉的概率
+        // ASR 与 OPUS-MT 由单一 native/JNI 路径加载，维持单 dex。
         multiDexEnabled false
     }
 
@@ -62,8 +73,7 @@ android {
     }
 
     // 模型随 APK 打包，且必须「不压缩」存储：
-    // 压缩过的 asset 在 open() 时会被整体解压进内存，622MB 的 model.bin 会直接 OOM；
-    // 不压缩才能用 AssetManager.openFd() 拿到长度做解包进度。
+    // 模型 asset 保持不压缩，避免读取时额外解压占用内存，并可用 openFd() 获取精确长度。
     androidResources {
         // 'model' / 'txt' 也一起存原样：不压缩才能用 openFd 问长度，解包进度才准
         noCompress 'bin', 'onnx', 'model', 'txt', 'json', 'spm'
@@ -92,13 +102,17 @@ android {
     }
 }
 
+android.applicationVariants.all { variant ->
+    variant.outputs.all { output ->
+        outputFileName = "vtrans-${variant.name}-b${buildNo}.apk"
+    }
+}
+
 dependencies {
     // sherpa-onnx 的 Java API（纯 Kotlin 编译产物，只用它做 VAD + ASR）
     implementation files('libs/sherpa-onnx-classes.jar')
 
     implementation 'androidx.appcompat:appcompat:1.7.0'
     implementation 'com.google.android.material:material:1.12.0'
-    implementation 'androidx.constraintlayout:constraintlayout:2.2.0'
     implementation 'androidx.core:core:1.15.0'
-    implementation 'androidx.preference:preference:1.2.1'
 }

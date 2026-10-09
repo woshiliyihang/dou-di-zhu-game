@@ -62,19 +62,11 @@ public final class Prefs {
     }
 
     public String targetLang() {
-        return sp.getString(K_TARGET_LANG, "zh");
-    }
-
-    public void setTargetLang(String v) {
-        sp.edit().putString(K_TARGET_LANG, v).apply();
+        return "zh";
     }
 
     public String sourceLang() {
-        return sp.getString(K_SOURCE_LANG, "auto");
-    }
-
-    public void setSourceLang(String v) {
-        sp.edit().putString(K_SOURCE_LANG, v).apply();
+        return "en";
     }
 
     public String tier() {
@@ -104,7 +96,7 @@ public final class Prefs {
     }
 
     public String audioMode() {
-        return sp.getString(K_AUDIO_MODE, AUDIO_AUTO);
+        return AUDIO_AUTO;
     }
 
     /**
@@ -121,20 +113,12 @@ public final class Prefs {
 
     /** 采集采样率 Hz，只认 16000 / 48000，其他值按默认处 16k 处理。 */
     public int captureRateHz() {
-        return sp.getInt(K_CAPTURE_RATE_HZ, 16000);
-    }
-
-    public void setCaptureRateHz(int v) {
-        sp.edit().putInt(K_CAPTURE_RATE_HZ, v == 48000 ? 48000 : 16000).apply();
+        return 16000;
     }
 
     /** 译文语音播报：true=仅检测到耳机时才朗读；false=是否插耳机都朗读。默认开启。 */
     public boolean ttsHeadsetOnly() {
-        return sp.getBoolean(K_TTS_HEADSET_ONLY, true);
-    }
-
-    public void setTtsHeadsetOnly(boolean v) {
-        sp.edit().putBoolean(K_TTS_HEADSET_ONLY, v).apply();
+        return true;
     }
 
     public void setAudioMode(String v) {

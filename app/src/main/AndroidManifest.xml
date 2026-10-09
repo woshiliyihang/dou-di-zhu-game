@@ -9,11 +9,6 @@
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
 
-    <!-- 模型随 APK 打包，全流程离线：这里刻意不申请任何网络权限 -->
-    <uses-permission android:name="android.permission.INTERNET" tools:node="remove" />
-    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" tools:node="remove" />
-    <uses-permission android:name="android.permission.ACCESS_NETWORK_INFO" tools:node="remove" />
-
     <uses-feature
         android:name="android.hardware.microphone"
         android:required="true" />

@@ -51,8 +51,8 @@ import java.util.concurrent.atomic.AtomicInteger;
  * 前台服务，持有整条翻译管线：
  *
  * <pre>
- * AudioCapture(20ms 帧) → VadSegmenter → AsrEngine(SenseVoice/Whisper)
- *      → SentenceSplitter → MtEngine(NLLB int8, JNI) → 广播给 UI
+ * AudioCapture(20ms 帧) → StreamingAsr(English) → SentenceSplitter
+ *      → MtEngine/OPUS-MT (English→Chinese) → 广播给 UI
  * </pre>
  *
  * <p>为什么放服务里：翻译要在息屏、切后台时继续，Activity 被回收不能影响链路。
@@ -60,6 +60,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 public class TranslateService extends Service {
 
     private static final String TAG = "TranslateService";
+    private static final String PERF_TAG = "VTransPerf";
 
     public static final String ACTION_START = "com.example.vtrans.START";
     public static final String ACTION_STOP = "com.example.vtrans.STOP";
@@ -71,7 +72,7 @@ public class TranslateService extends Service {
     public static final String EXTRA_KIND = "kind";       // partial / final / translation
     public static final String EXTRA_TEXT = "text";
     public static final String EXTRA_SEQ = "seq";         // 递增序号，UI 用来决定替换还是追加
-    public static final String EXTRA_LANG = "lang";       // 该文本的源语言（NLLB 码）
+    public static final String EXTRA_LANG = "lang";       // 固定源语言：en
     public static final String EXTRA_LATENCY = "latency"; // ms
 
     public static final String EXTRA_STATE = "state";     // loading / running / error
@@ -95,16 +96,13 @@ public class TranslateService extends Service {
     private VadSegmenter vad;
     private AsrEngine asr;
     private MtEngine mt;
-    /**
-     * 当前翻译引擎是语对专用模型（只认英→中）。它没有语言码体系，喂中文进去
-     * 不会报错、只会很自信地输出一串胡话，所以调用方要靠它把中文句子拦下来。
-     */
-    private volatile boolean pairMt;
+    private volatile boolean translationModelReady;
+    private volatile String translationModelError;
     private TtsSpeaker tts;
 
     /**
-     * 流式识别引擎。非 null 时它就是主识别器：音频只喂 {@link #feedStreaming}，
-     * VAD/SenseVoice 那一路不再喂数据——它只在流式模型缺失或加载失败时才接手。
+     * 流式识别引擎。非 null 时它就是主识别器：音频只喂 {@link #feedStreaming}；
+     * 流式英文模型是必需项，缺失或加载失败会明确报错，不切换到其他识别器。
      */
     private StreamingAsr streaming;
     private ExecutorService streamExec;
@@ -114,6 +112,7 @@ public class TranslateService extends Service {
     private ScheduledExecutorService partialTimer;
     private final AtomicBoolean partialBusy = new AtomicBoolean(false);
     private final AtomicInteger seq = new AtomicInteger(0);
+    private final AtomicInteger perfSentenceSeq = new AtomicInteger(0);
 
     /**
      * 定稿优先：&gt;0 表示有定稿段正在识别或在 asrExec 上排队。增量预览和定稿共用
@@ -121,6 +120,7 @@ public class TranslateService extends Service {
      * 长句尾拍预览越慢，用户就会感到「明明说完了却还在转圈」。
      */
     private final AtomicInteger finalQueued = new AtomicInteger(0);
+    private int slowFeedCount;
 
     /**
      * 残句长到这个程度就立刻翻，别再等拼接：等拼接换回来的是句子更连贯，
@@ -137,7 +137,7 @@ public class TranslateService extends Service {
     private final Stats mtStats = new Stats(8);
 
     /**
-     * 引擎还在加载时抵达的语音段。点「开始翻译」到 NLLB/SenseVoice 装好有 1~5 秒，
+     * 引擎还在加载时抵达的语音段。点「开始翻译」到英文流式识别模型装好需要时间，
      * 而用户往往就在这段时间开口 —— 所以先开录音、把这段里的段攒着，引擎就绪后按序补跑。
      * 只在录音线程写入、asrExec 读取/排空，统一用 {@code pendingLock}。
      */
@@ -216,17 +216,6 @@ public class TranslateService extends Service {
         }
     }
 
-    /** PerfGuard：连续降级计数，避免每隔几句就抖一次线程数 */
-    private final AtomicInteger degradeLevel = new AtomicInteger(0);
-    private long latencyBaselineMs = 0;
-    /** 翻译线程数的下限：1 线程翻 600M 每句要好几秒，那不是省电那是卡 */
-    private static final int MIN_MT_THREADS = 2;
-    /** 绝对门槛：慢到用户能感觉到才降级，别拿「比冷机头几句慢」当理由 */
-    private static final long DEGRADE_FLOOR_MS = 900;
-    /** 连续这么多句明显快于基线，就把降掉的档位升回去 */
-    private static final int RECOVER_STREAK = 5;
-    private int fastStreak;
-
     public class LocalBinder extends Binder {
         public TranslateService getService() {
             return TranslateService.this;
@@ -269,17 +258,23 @@ public class TranslateService extends Service {
                     getPackageManager().getPackageInfo(getPackageName(), 0);
             Log.i(TAG, "构建 b" + (pi.versionCode - 10000) + "（" + pi.versionName + "/"
                     + pi.versionCode + "）");
+            Log.i(PERF_TAG, "stage=session_start version_name=" + pi.versionName
+                    + " version_code=" + pi.versionCode
+                    + " device=" + Build.MANUFACTURER + "/" + Build.MODEL
+                    + " sdk=" + Build.VERSION.SDK_INT);
         } catch (Exception e) {
             Log.w(TAG, "取构建号失败", e);
         }
         clearSnapshot(); // 新会话：历史文本清空，防止 UI 重建读到上一轮的残影
-        // 新会话重新建基线：上一轮的降级档位和延迟基线留给这一轮没有任何意义
-        // （引擎是新的，机器温度也是新的），否则会出现「上次热过、这次一上来就是低档」。
-        degradeLevel.set(0);
-        latencyBaselineMs = 0;
-        fastStreak = 0;
+        translationModelReady = false;
+        translationModelError = null;
         asrStats.reset();
         mtStats.reset();
+        perfSentenceSeq.set(0);
+        streamDrops.set(0);
+        streamBacklog.set(0);
+        slowFeedCount = 0;
+        audioFrames = 0;
         splitter.reset();
         // startForeground 可能因「后台启动 FGS 被系统拒绝」「通知被用户禁用」抛异常：
         // START_STICKY 重启（intent 为 null）、权限被拒等场景都会走到这里，不兜底会崩。
@@ -305,8 +300,8 @@ public class TranslateService extends Service {
     /**
      * 起录音 + 加载模型。
      *
-     * <p><b>顺序很关键</b>：先建 VAD（只有 208KB，几十毫秒）并把麦克风升起来，
-     * 再慢慢装 NLLB(622MB) / SenseVoice(237MB)。老顺序是先装模型再开录音，
+     * <p><b>顺序很关键</b>：先建 VAD（只有约 208KB）并把麦克风升起来，
+     * 再解包并加载英文流式识别模型。老顺序是先装模型再开录音，
      * 中间那 1~5 秒里根本没在采集，用户点完按钮本能就开口，第一句整段丢失。
      * 现在这段时间里的语音段进了 {@link #pendingSegments}，引擎就绪后按序补跑。
      */
@@ -329,10 +324,15 @@ public class TranslateService extends Service {
             enginesReady = true;
             drainPendingSegments();
 
-            broadcastStatus("running", "已开始（provider=" + provider + "）");
+            String message = translationModelReady ? "正在聆听：英语 → 中文"
+                    : translationModelError != null
+                            ? "英→中翻译模型加载失败，请重新启动"
+                            : "正在聆听（正在准备英→中翻译模型）…";
+            broadcastStatus("running", message);
             updateNotification("正在聆听…");
         } catch (Throwable t) {
             Log.e(TAG, "管线启动失败", t);
+            Log.e(PERF_TAG, "stage=pipeline_start status=error", t);
             // 服务已进入停止流程时不必再打扰 UI
             if (!running) return;
             broadcastStatus("error", t.getMessage());
@@ -341,42 +341,34 @@ public class TranslateService extends Service {
         }
     }
 
-    /**
-     * 首次推理预热：ONNX session 第一次 run 要图优化 + 分配内存，实测比后续慢很多倍，
-     * 不预热的话「第一句」明显最慢、也最容易掉字。拿随包的 bench_zh.wav 跑一遍，结果丢掉。
-     * <p>跑在 asrExec 上（就是它自己），不占录音线程；MT 预热排到 mtExec 队尾，
-     * 不阻塞后面的真活。失败只记日志，绝不影响启动。
-     */
+    /** Warm up the translator without blocking audio capture. */
     private void warmUpEngines() {
-        long t0 = System.currentTimeMillis();
-        try {
-            float[] wav = WaveReader.read(this, "bench_zh.wav");
-            // 取前 2 秒就够：目的是走一遍图，不是验质量
-            int n = Math.min(wav.length, 2 * VadSegmenter.SAMPLE_RATE);
-            if (n < VadSegmenter.SAMPLE_RATE / 2) return;
-            float[] probe = Arrays.copyOfRange(wav, 0, n);
-            AsrEngine a = asr;
-            if (a != null && a.hasSenseVoice()) {
-                a.transcribe(AsrEngine.Which.SENSEVOICE, probe);
-            }
-        } catch (Throwable t) {
-            Log.i(TAG, "ASR 预热跳过（不影响使用）: " + t.getMessage());
-        }
-        final MtEngine m = mt;
-        if (m != null) {
+        final MtEngine engine = mt;
+        if (engine != null) {
             try {
                 mtExec.execute(() -> {
+                    long t0 = android.os.SystemClock.elapsedRealtime();
                     try {
-                        m.translate("你好。", "zho_Hans", prefs.targetLang());
-                    } catch (Throwable ignored) {
-                        // 预热失败无所谓
+                        String result = engine.translate("Could you help me?", "en", "zh");
+                        if (result == null || result.trim().isEmpty()) {
+                            throw new IllegalStateException("英中翻译预热返回空结果");
+                        }
+                        Log.i(PERF_TAG, "stage=mt_warmup status=ok elapsed_ms="
+                                + (android.os.SystemClock.elapsedRealtime() - t0));
+                    } catch (Throwable t) {
+                        translationModelReady = false;
+                        translationModelError = t.getMessage();
+                        Log.e(PERF_TAG, "stage=mt_warmup status=error elapsed_ms="
+                                + (android.os.SystemClock.elapsedRealtime() - t0), t);
+                        if (running) {
+                            broadcastStatus("error", "英→中翻译预热失败：" + t.getMessage());
+                        }
                     }
                 });
-            } catch (Throwable ignored) {
-                // mtExec 已关闭，服务在停
+            } catch (RejectedExecutionException e) {
+                Log.w(TAG, "翻译预热未能排队，服务正在停止", e);
             }
         }
-        Log.i(TAG, "引擎预热完成，耗时 " + (System.currentTimeMillis() - t0) + "ms");
     }
 
     /** 把模型加载期间攒下的段按原顺序交给识别，保证上屏顺序与实际说话顺序一致。 */
@@ -405,55 +397,48 @@ public class TranslateService extends Service {
     }
 
     private void loadEngines(String provider) {
-        int threads = prefs.mtThreads();
-        File mtDir = models.mtDir();
-        mt = MtEngine.create(mtDir.getAbsolutePath(), threads, prefs.beamForTier());
-        if (mt == null && !mtDir.equals(models.nllbDir())) {
-            // 语对专用模型（OPUS-MT）没有 NLLB 那套语言码体系，得新版 native 才认。
-            // 旧 libvtrans-mt.so 只找 sentencepiece.bpe.model，读它就返回 null ——
-            // 这时退回 NLLB：照常能用，只是每 token 仍是 45ms 那个量级。
-            Log.w(TAG, "翻译模型 " + mtDir.getName() + " 加载失败（libvtrans-mt.so 该重编了），退回 NLLB");
-            mtDir = models.nllbDir();
-            mt = MtEngine.create(mtDir.getAbsolutePath(), threads, prefs.beamForTier());
+        if (!streamingIntended) {
+            throw new IllegalStateException("缺少英文流式识别模型，请重新安装完整模型包");
+        }
+        long mtLoadStarted = android.os.SystemClock.elapsedRealtime();
+        unpackIfNeeded(ModelsManifest.OPUS_MT_EN_ZH);
+        try {
+            mt = MtEngine.create(models.resolve("opus-mt-en-zh").getAbsolutePath(),
+                    Math.min(2, Runtime.getRuntime().availableProcessors()), 1);
+        } catch (RuntimeException | Error t) {
+            Log.e(PERF_TAG, "stage=mt_load status=error elapsed_ms="
+                    + (android.os.SystemClock.elapsedRealtime() - mtLoadStarted), t);
+            throw t;
         }
         if (mt == null) {
-            // mt_engine 的 lastError 没走 JNI 暴露，native 侧的原因看不到，
-            // 所以把模型目录打出来：少文件 / 文件不全是最常见的原因
-            Log.e(TAG, "翻译模型加载失败，目录内容：" + describeDir(mtDir));
-            throw new IllegalStateException("翻译模型加载失败（" + mtDir + "）");
+            translationModelError = "CTranslate2 无法加载内置 OPUS-MT 模型";
+            Log.e(PERF_TAG, "stage=mt_load status=error elapsed_ms="
+                    + (android.os.SystemClock.elapsedRealtime() - mtLoadStarted)
+                    + " reason=" + translationModelError);
+            throw new IllegalStateException(translationModelError);
         }
-        Log.i(TAG, "翻译模型: " + mtDir.getName() + "，" + threads + " 线程");
-        pairMt = !mtDir.equals(models.nllbDir());
-        asr = AsrEngine.create(models, provider, Math.min(2, threads), prefs.sourceLang());
+        translationModelReady = true;
+        translationModelError = null;
+        Log.i(PERF_TAG, "stage=mt_load status=ok elapsed_ms="
+                + (android.os.SystemClock.elapsedRealtime() - mtLoadStarted)
+                + " model=opus-mt-en-zh-int8");
+        if (running) broadcastStatus("running", "英→中翻译模型已就绪");
 
-        // 提前把 Whisper 载好：高精档、或用户明确选了非中/粤语种时这句一定会用到。
-        // auto + 均衡档的中文用户不预载 —— 375MB 模型白占内存还拖慢启动。
-        String src = prefs.sourceLang();
-        boolean eagerWhisper = Prefs.TIER_QUALITY.equals(prefs.tier())
-                || (!"auto".equals(src) && !isZhish(src));
-        if (eagerWhisper && models.isReady(ModelsManifest.WHISPER) && !asr.hasWhisper()) {
-            asr.switchWhisperLang(models, provider, Math.min(2, threads), src);
+        unpackIfNeeded(ModelsManifest.ZIPFORMER_EN);
+        long asrLoadStarted = android.os.SystemClock.elapsedRealtime();
+        StreamingAsr s = StreamingAsr.create(models, "cpu",
+                Math.min(2, Runtime.getRuntime().availableProcessors()));
+        if (s == null) {
+            throw new IllegalStateException("英文流式识别模型加载失败");
         }
-
-        // 流式优先：装了英文流式模型就把它当主识别器。provider 一律给 cpu：
-        // chunk 化的 zipformer 在 NNAPI/XNNPACK 上算子回退很多，并不比 cpu 稳。
-        // 预热必须在把 streaming 发布出去之前做：那一刻起音频帧才会开始并发改这个流。
-        if (streamingIntended) {
-            unpackIfNeeded(ModelsManifest.ZIPFORMER_EN);
-            StreamingAsr s = StreamingAsr.create(models, "cpu", Math.min(2, threads));
-            if (s == null) {
-                streamingIntended = false;
-                Log.w(TAG, "流式模型存在但加载失败，本轮退回 SenseVoice");
-            } else {
-                warmUpStreaming(s);
-                streamExec = Executors.newSingleThreadExecutor(
-                        r -> new Thread(r, "vtrans-stream"));
-                // 先把加载期间攒下的帧按序入队，再发布 streaming：反过来写就会
-                // 出现新帧排在旧帧前面，流式解码按到达顺序累计特征，顺序乱了字就乱。
-                drainPendingFrames(s);
-                streaming = s;
-            }
-        }
+        Log.i(PERF_TAG, "stage=asr_load status=ok elapsed_ms="
+                + (android.os.SystemClock.elapsedRealtime() - asrLoadStarted)
+                + " model=zipformer-en-int8");
+        warmUpStreaming(s);
+        streamExec = Executors.newSingleThreadExecutor(
+                r -> new Thread(r, "vtrans-stream"));
+        drainPendingFrames(s);
+        streaming = s;
     }
 
     /**
@@ -462,15 +447,22 @@ public class TranslateService extends Service {
      * 所以引擎加载前顺手拷掉（70MB 约 1 秒，期间音频帧已经攒在 pendingFrames 里）。
      */
     private void unpackIfNeeded(ModelsManifest.Model m) {
-        if (models.isReady(m)) return;
+        if (models.isReady(m)) {
+            Log.i(PERF_TAG, "stage=model_unpack status=already_ready model=" + m.id);
+            return;
+        }
+        long bytes = models.bytesToUnpack(
+                java.util.Collections.singletonList(m));
         long t0 = System.currentTimeMillis();
         try {
             models.ensure(m, null);
-            Log.i(TAG, m.label + " 已自动解包，耗时 "
-                    + (System.currentTimeMillis() - t0) + "ms");
+            long elapsed = System.currentTimeMillis() - t0;
+            Log.i(TAG, m.label + " 已自动解包，耗时 " + elapsed + "ms");
+            Log.i(PERF_TAG, "stage=model_unpack status=ok model=" + m.id
+                    + " bytes=" + bytes + " elapsed_ms=" + elapsed);
         } catch (Throwable t) {
-            // 空间不够 / 拷贝中断都不能把整条链路带崩：没它照样能翻译，只是回到旧时序
-            Log.w(TAG, m.label + " 自动解包失败，本轮不用它: " + t.getMessage());
+            Log.e(PERF_TAG, "stage=model_unpack status=error model=" + m.id, t);
+            throw new IllegalStateException(m.label + " 自动解包失败", t);
         }
     }
 
@@ -510,6 +502,10 @@ public class TranslateService extends Service {
             // 折叠掉（上一轮就是这样：实际丢了几百帧，文件里只留下 4 行）。
             // 所以改成每 50 帧报一次累计数。
             int n = streamDrops.incrementAndGet();
+            if (n == 1 || n % 50 == 0) {
+                Log.w(PERF_TAG, "stage=asr_queue status=frame_dropped total_dropped="
+                        + n + " backlog=" + streamBacklog.get());
+            }
             if (n % 50 == 1) {
                 Log.w(TAG, "流式队列积压，丢弃本帧（累计丢 " + n + " 帧，backlog="
                         + streamBacklog.get() + "）");
@@ -521,7 +517,14 @@ public class TranslateService extends Service {
             streamExec.execute(() -> {
                 streamBacklog.decrementAndGet();
                 if (!running) return;
+                long feedStarted = android.os.SystemClock.elapsedRealtime();
                 String sentence = engine.feed(copy);
+                long feedElapsed = android.os.SystemClock.elapsedRealtime() - feedStarted;
+                if (feedElapsed > 20 && (++slowFeedCount % 10) == 1) {
+                    Log.w(PERF_TAG, "stage=asr_feed status=over_20ms elapsed_ms="
+                            + feedElapsed + " count=" + slowFeedCount
+                            + " backlog=" + streamBacklog.get());
+                }
                 if (sentence != null) {
                     lastStreamPartial = "";
                     onStreamSentence(sentence);
@@ -540,6 +543,7 @@ public class TranslateService extends Service {
             });
         } catch (Throwable t) {
             streamBacklog.decrementAndGet();
+            Log.e(PERF_TAG, "stage=asr_queue status=submit_error", t);
         }
     }
 
@@ -555,15 +559,15 @@ public class TranslateService extends Service {
      * endpoint 命中的时候已经算完了，体感延迟从此只剩「判停确认 + 翻译」。
      */
     private void onStreamSentence(String text) {
+        long endpointAt = android.os.SystemClock.elapsedRealtimeNanos();
         String srcLang = streamLang();
-        // 语种按书写系统再判一次：万一用户中途改口说中文，detectLang 会给出 zho，
-        // 交给 NLLB 的编码才对得上（流式英文模型硬把中文念成空白时也走这里）。
-        String detected = MtEngine.detectLang(text);
-        if ("auto".equals(prefs.sourceLang()) && detected != null) srcLang = detected;
-
+        Log.i(PERF_TAG, "stage=asr_endpoint status=ok text_chars=" + text.length()
+                + " backlog_frames=" + streamBacklog.get()
+                + " dropped_frames=" + streamDrops.get());
+        // 方向固定为英语转中文；中文语音不属于当前识别输入范围。
         Log.i(TAG, String.format(Locale.ROOT, "定稿(流式): %s", abbrev(text)));
         broadcast("final", text, srcLang, 0);
-        enqueueTranslation(splitter.push(text), srcLang);
+        enqueueTranslation(splitter.push(text), srcLang, endpointAt);
         handleTail(srcLang);
     }
 
@@ -586,18 +590,6 @@ public class TranslateService extends Service {
         synchronized (pendingLock) {
             return pendingFrames.pollFirst();
         }
-    }
-
-    /** 列出目录里的文件与大小，排查"模型到底解包全了没有" */
-    private static String describeDir(File dir) {
-        File[] files = dir.listFiles();
-        if (files == null) return "<目录不存在或不可读>";
-        StringBuilder sb = new StringBuilder();
-        for (File f : files) {
-            if (sb.length() > 0) sb.append(", ");
-            sb.append(f.getName()).append('=').append(f.length());
-        }
-        return "[" + sb + "]";
     }
 
     private void startCapture(String provider) {
@@ -669,9 +661,13 @@ public class TranslateService extends Service {
         capture.setMicBoostDb(prefs.micBoostDb());
         capture.setCaptureRateHz(prefs.captureRateHz());
         acquireWakeLock();
+        long captureStartedAt = android.os.SystemClock.elapsedRealtime();
         if (!capture.start()) {
             throw new IllegalStateException("无法启动录音");
         }
+        Log.i(PERF_TAG, "stage=audio_capture status=ok elapsed_ms="
+                + (android.os.SystemClock.elapsedRealtime() - captureStartedAt)
+                + " sample_rate_hz=" + prefs.captureRateHz());
         Log.i(TAG, "录音处理方案：" + capture.summary());
 
         // 增量预览只在高精档以外才有意义；否则定时器每拍进来就 return，纯空转。
@@ -682,23 +678,9 @@ public class TranslateService extends Service {
         }
     }
 
-    /**
-     * 实际使用的录音处理方案。
-     *
-     * <p><b>硬件回声消除优先</b>：系统 {@link android.media.audiofx.AcousticEchoCanceler}
-     * 基本只在通话音源（VOICE_COMMUNICATION）上才会被 ROM 真正启用，这是压制
-     * 「TTS 外放播报 → 被本机麦克风拾取 → 再识别再翻译」回环的关键。
-     *
-     * <p>但通话音源会带上一整套通信优化（可能是窄带/强压缩），对远场识别不友好，
-     * 所以只在真的存在外放回声源时才切过去：即用户关掉了「仅插入耳机时播报译文」。
-     * 默认（仅耳机播报）扬声器不发声，没有回声源，继续用识别音源，识别质量不受影响。
-     */
+    /** 译文仅通过耳机输出，录音始终使用自动识别音源。 */
     private String effectiveAudioMode() {
-        String mode = prefs.audioMode();
-        if (Prefs.AUDIO_AUTO.equals(mode) && !prefs.ttsHeadsetOnly()) {
-            return Prefs.AUDIO_SYSTEM;
-        }
-        return mode;
+        return Prefs.AUDIO_AUTO;
     }
 
     /** 增量预览：只在均衡档做，且上一轮跑完才发下一轮 */
@@ -729,7 +711,7 @@ public class TranslateService extends Service {
                     // shutdown 与任务执行之间可能交错，识别要容忍 running 翻转
                     String text = engine.transcribe(AsrEngine.Which.SENSEVOICE, samples);
                     if (text != null && !text.isEmpty()) {
-                        broadcast("partial", text, MtEngine.detectLang(text), 0);
+                        broadcast("partial", text, prefs.sourceLang(), 0);
                     }
                 } catch (Throwable t) {
                     Log.w(TAG, "增量识别失败", t);
@@ -786,9 +768,8 @@ public class TranslateService extends Service {
 
                 // SenseVoice 的 auto 语种标签不可信（实测每个语种都返回 <|yue|>），
                 // 所以语种一律按"识别出来的文字用了哪种书写系统"来定。
-                String detected = text == null ? null : MtEngine.detectLang(text);
-                srcLang = "auto".equals(srcSetting)
-                        ? (detected == null ? "eng_Latn" : detected) : srcSetting;
+                String detected = "eng_Latn";
+                srcLang = srcSetting;
 
                 // Whisper 只在该用的时候用，且按语种懒加载（375MB 不常驻内存）。
                 // looksMissed：整段够长（≥1.2s，段首尾静音已被 VadSegmenter 裁掉）
@@ -810,9 +791,7 @@ public class TranslateService extends Service {
                     if (better != null && !better.isEmpty()) {
                         text = better;
                         // 以 Whisper 结果为准重判一次语种（兜底路径下 SenseVoice 没输出可判）
-                        detected = MtEngine.detectLang(better);
-                        srcLang = "auto".equals(srcSetting)
-                                ? (detected == null ? "eng_Latn" : detected) : srcSetting;
+                        srcLang = srcSetting;
                     }
                 }
 
@@ -936,25 +915,20 @@ public class TranslateService extends Service {
     /**
      * 把一批句子交给翻译线程。
      *
-     * <p>多句合并成一次 {@code translateBatch}：CTranslate2 的批量解码把若干次
-     * GEMV 合成一次 GEMM，两句的总时间远小于「串行翻两遍」（实测每句 ~0.85s，
-     * 批下来接近 1.1s 而不是 1.7s）。单句仍走原路径，不为凑批让首句多等。
+     * <p>保持同一翻译队列以维持译文顺序；每句翻完立即上屏，不等待同一段里的后续句子。
      *
      * <p>纯语气词在这一步再筛一次：识别结果里的「嗯。」「oh.」带终止符，
      * 会直接从 push() 出句，绕过 submitFinal 末尾那道残句过滤。
      */
     private void enqueueTranslation(List<String> sentences, String srcLang) {
+        enqueueTranslation(sentences, srcLang,
+                android.os.SystemClock.elapsedRealtimeNanos());
+    }
+
+    private void enqueueTranslation(List<String> sentences, String srcLang, long endpointAtNs) {
         if (sentences == null || sentences.isEmpty()) return;
         final MtEngine engine = mt;
         if (engine == null) return;
-        if (pairMt && isZhish(srcLang)) {
-            // 语对专用模型只认英→中：中文喂进去不报错，只会产出看着像模像样的胡话。
-            // 宁可把原文当译文上屏（中途改口说中文、或误检成中文时就是这种情形）。
-            for (String s : sentences) {
-                if (s != null && !s.trim().isEmpty()) broadcast("translation", s, srcLang, 0);
-            }
-            return;
-        }
         List<String> batch = null;
         for (String s : sentences) {
             if (s == null || s.trim().isEmpty() || isPureFiller(s)) continue;
@@ -964,33 +938,59 @@ public class TranslateService extends Service {
         if (batch == null) return;
         final List<String> todo = batch;
         final String[] texts = todo.toArray(new String[0]);
+        final long enqueuedAtNs = android.os.SystemClock.elapsedRealtimeNanos();
         try {
             mtExec.execute(() -> {
-                long t0 = System.currentTimeMillis();
-                String[] outs = null;
                 try {
-                    outs = texts.length == 1
-                            ? new String[]{engine.translate(texts[0], srcLang, prefs.targetLang())}
-                            : engine.translateBatch(texts, srcLang, prefs.targetLang());
+                    for (int i = 0; i < texts.length; i++) {
+                        int sentenceSeq = perfSentenceSeq.incrementAndGet();
+                        long startedAtNs = android.os.SystemClock.elapsedRealtimeNanos();
+                        long queuedMs = (startedAtNs - enqueuedAtNs) / 1_000_000L;
+                        long inferenceStartedAtNs = startedAtNs;
+                        String out;
+                        try {
+                            out = engine.translate(texts[i], "en", "zh");
+                        } catch (RuntimeException | Error t) {
+                            Log.e(PERF_TAG, "stage=translate status=error seq=" + sentenceSeq
+                                    + " queue_ms=" + queuedMs + " input_chars="
+                                    + texts[i].length(), t);
+                            throw t;
+                        }
+                        long completedAtNs = android.os.SystemClock.elapsedRealtimeNanos();
+                        long ms = (completedAtNs - inferenceStartedAtNs) / 1_000_000L;
+                        if (out == null) {
+                            IllegalStateException error =
+                                    new IllegalStateException("CTranslate2 翻译返回空结果");
+                            Log.e(PERF_TAG, "stage=translate status=error seq=" + sentenceSeq
+                                    + " queue_ms=" + queuedMs + " inference_ms=" + ms
+                                    + " input_chars=" + texts[i].length(), error);
+                            throw error;
+                        }
+                        translationModelReady = true;
+                        translationModelError = null;
+                        mtStats.add(ms);
+                        Log.i(PERF_TAG, String.format(Locale.ROOT,
+                                "stage=translate status=ok seq=%d queue_ms=%d inference_ms=%d "
+                                        + "endpoint_to_result_ms=%d input_chars=%d output_chars=%d",
+                                sentenceSeq, queuedMs, ms,
+                                (completedAtNs - endpointAtNs) / 1_000_000L,
+                                texts[i].length(), out.length()));
+                        if (i == 0) {
+                            broadcastStatus("running", "正在聆听：英语 → 中文");
+                        }
+                        if (!out.trim().isEmpty()) {
+                            broadcast("translation", out, prefs.targetLang(), ms);
+                            speakTranslation(out, prefs.targetLang());
+                        }
+                        updateStats();
+                    }
                 } catch (Throwable t) {
-                    Log.e(TAG, "翻译失败", t);
+                    Log.e(PERF_TAG, "stage=translate_batch status=error", t);
+                    translationModelError = t.getMessage();
+                    if (running) {
+                        broadcastStatus("error", "英→中翻译失败：" + t.getMessage());
+                    }
                 }
-                long ms = System.currentTimeMillis() - t0;
-                // 批量时按句摊平再进统计：PerfGuard 的基线要表示"每句成本"才有意义
-                mtStats.add(ms / texts.length);
-                // 翻译这一环的耗时（含排队）单独记一条：它和识别是分开的两个线程
-                Log.i(TAG, String.format(Locale.ROOT, "译文: %dms %d句%d字 level=%d ← %s",
-                        ms, texts.length, srcChars(todo), degradeLevel.get(),
-                        abbrev(texts[0])));
-                if (outs == null) return;
-                for (int i = 0; i < outs.length && i < texts.length; i++) {
-                    String out = outs[i];
-                    if (out == null || out.trim().isEmpty()) continue;
-                    broadcast("translation", out, prefs.targetLang(), ms);
-                    speakTranslation(out, prefs.targetLang());
-                }
-                guardPerformance();
-                updateStats();
             });
         } catch (Throwable t) {
             // executor 已 shutdown：忽略
@@ -1001,12 +1001,6 @@ public class TranslateService extends Service {
     private static String abbrev(String s) {
         if (s == null) return "";
         return s.length() > 18 ? s.substring(0, 18) + "…" : s;
-    }
-
-    private static int srcChars(List<String> sentences) {
-        int n = 0;
-        for (String s : sentences) n += s.length();
-        return n;
     }
 
     /**
@@ -1035,65 +1029,10 @@ public class TranslateService extends Service {
             Arrays.asList("uh", "um", "oh", "ah", "er", "mm", "eh", "hmm"));
     private static final String FILLER_ZH = "嗯哦啊呃呢哈呀噢唔嘞嘛哎咳唔";
 
-    /** 译文语音播报；是否出声由「仅耳机播报」开关决定（见 TtsSpeaker） */
+    /** 译文只允许经耳机播报。 */
     private void speakTranslation(String text, String targetLang) {
         TtsSpeaker t = tts;
-        if (t != null) t.speak(text, targetLang, prefs.ttsHeadsetOnly());
-    }
-
-    /**
-     * PerfGuard：骁龙 888 发热降频很凶，持续降频时减少并发能止损一点。
-     *
-     * <p>三条纪律是老实现缺的，也是「越用越顿」的直接原因：
-     * <ol>
-     *   <li><b>要有绝对门槛</b>：冷机头几句特别快，基线被钉在 200ms 之后，正常
-     *       六七百毫秒也算「超基线 2.5 倍」，一上来就被降档。</li>
-     *   <li><b>要有下限</b>：降到 1 线程时 NLLB-600M 每句要好几秒，「省电」变成「卡」，
-     *       与同传的初衷相反，所以最低只到 {@link #MIN_MT_THREADS}。</li>
-     *   <li><b>要能回升</b>：机器凉下来之后必须把档位升回去，否则一次偶发抖动就永久锁死。</li>
-     * </ol>
-     * <p>只在 mtExec 单线程上调用，fastStreak/latencyBaselineMs 不需要额外同步。
-     */
-    private void guardPerformance() {
-        if (mt == null || mtStats.count() < 5) return;
-        long avg = mtStats.avgMs();
-        if (latencyBaselineMs == 0) {
-            latencyBaselineMs = Math.max(300, avg);
-            return;
-        }
-        long base = latencyBaselineMs;
-        int level = degradeLevel.get();
-        if (avg > base * 2.5 && avg > DEGRADE_FLOOR_MS) {
-            fastStreak = 0;
-            if (level == 0 && prefs.mtThreads() > MIN_MT_THREADS) {
-                mt.setThreads(MIN_MT_THREADS);
-                degradeLevel.set(1);
-                latencyBaselineMs = avg;
-                updateNotification("设备发热，翻译已降到 " + MIN_MT_THREADS + " 线程");
-                Log.i(TAG, String.format(Locale.ROOT,
-                        "PerfGuard 降级: avg=%dms 基线=%dms → %d 线程", avg, base, MIN_MT_THREADS));
-            } else if (level <= 1 && prefs.beamForTier() > 1) {
-                mt.setBeam(1);
-                degradeLevel.set(2);
-                latencyBaselineMs = avg;
-                updateNotification("设备发热，解码宽度已降到 beam=1");
-                Log.i(TAG, String.format(Locale.ROOT,
-                        "PerfGuard 降级: avg=%dms 基线=%dms → beam=1", avg, base));
-            }
-        } else if (level > 0 && avg < base * 1.3) {
-            if (++fastStreak >= RECOVER_STREAK) {
-                fastStreak = 0;
-                mt.setThreads(prefs.mtThreads());
-                mt.setBeam(prefs.beamForTier());
-                degradeLevel.set(0);
-                latencyBaselineMs = Math.max(300, avg);
-                Log.i(TAG, String.format(Locale.ROOT,
-                        "PerfGuard 回升: avg=%dms → %d 线程 / beam=%d",
-                        avg, prefs.mtThreads(), prefs.beamForTier()));
-            }
-        } else {
-            fastStreak = 0;
-        }
+        if (t != null) t.speak(text, targetLang);
     }
 
     private void updateStats() {

@@ -123,9 +123,10 @@ def main() -> int:
     # 大小吻合才算下完了（探测到过 1 字节的错误长度，别把一个残缺文件当完成）
     if os.path.exists(out) and os.path.getsize(out) == length:
         print(f"skip (exists): {out} ({human(length)})")
-        if args.sha256:
-            return 0 if verify_sha256(out, args.sha256) else 1
-        return 0
+        if not args.sha256 or verify_sha256(out, args.sha256):
+            return 0
+        print("校验失败，删除旧文件并重新下载", file=sys.stderr)
+        os.remove(out)
 
     chunk = parse_size(args.chunk)
     parts_dir = out + ".parts"

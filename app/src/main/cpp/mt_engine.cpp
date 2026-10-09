@@ -156,8 +156,7 @@ class MtEngineImpl : public MtEngine {
       cfg.num_threads_per_replica = threads_ > 0 ? threads_ : 4;
       translator_.reset(new ctranslate2::Translator(
           model_dir_, ctranslate2::Device::CPU,
-          ctranslate2::ComputeType::INT8, std::vector<int>{0},
-          false, cfg));
+          ctranslate2::ComputeType::INT8, std::vector<int>{0}, cfg));
       return true;
     } catch (const std::exception& e) {
       last_error_ = std::string("ct2 init failed: ") + e.what();

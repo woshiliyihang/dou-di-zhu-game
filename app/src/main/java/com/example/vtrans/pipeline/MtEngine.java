@@ -1,10 +1,9 @@
 package com.example.vtrans.pipeline;
 
 /**
- * NLLB-200 (CTranslate2 int8) 翻译引擎的 JNI 封装。
+ * CTranslate2 int8 翻译引擎的 JNI 封装。
  *
- * <p>对应 native 实现在 app/src/main/cpp/{mt_engine.cpp,jni_bridge.cpp}，
- * 那份源码在 x86 与 arm64 上跑同一套逻辑（见 tools/host_test 的验证结果）。
+ * <p>对应 native 实现在 app/src/main/cpp/{mt_engine.cpp,jni_bridge.cpp}。
  */
 public final class MtEngine {
 
@@ -18,7 +17,7 @@ public final class MtEngine {
         this.handle = handle;
     }
 
-    /** @return 引擎实例；模型加载失败返回 null（622MB 的模型要 0.3~1s） */
+    /** @return 引擎实例；模型加载失败返回 null */
     public static MtEngine create(String modelDir, int threads, int beam) {
         long h = nativeInit(modelDir, threads, beam);
         return h == 0 ? null : new MtEngine(h);
@@ -56,8 +55,8 @@ public final class MtEngine {
     }
 
     /**
-     * 按文字的书写系统猜源语言，返回 NLLB 语言码（zho_Hans / eng_Latn ...）。
-     * 用来给 NLLB 指定源语言：识别出来的文本是英文却按中文喂进去，译文会完全跑偏。
+     * 按文字的书写系统猜源语言，返回 NLLB 风格语言码（zho_Hans / eng_Latn 等）。
+     * 当前固定英中方向，主要留作旧接口兼容。
      */
     public static String detectLang(String text) {
         String r = nativeDetectLang(text);
