@@ -21,7 +21,10 @@ JOBS="${JOBS:-8}"
 cd "$(dirname "$0")/.."   # 仓库根
 
 echo "==> 1/5 基础工具"
-if ! command -v cmake >/dev/null 2>&1; then
+if ! command -v cmake >/dev/null 2>&1 || ! command -v ninja >/dev/null 2>&1 \
+  || ! command -v file >/dev/null 2>&1 || ! command -v git >/dev/null 2>&1 \
+  || ! command -v unzip >/dev/null 2>&1 || ! command -v curl >/dev/null 2>&1 \
+  || ! command -v gcc >/dev/null 2>&1 || ! command -v g++ >/dev/null 2>&1; then
   sudo apt-get update -qq
   sudo apt-get install -y -qq cmake ninja-build git build-essential unzip curl file
 fi
@@ -75,11 +78,28 @@ echo "jni symbols = ${JNI_N:-0}"
 echo "--- CT2 确实链进来了吗 ---"
 echo "ctranslate2 symbols = ${CT2_N:-0}"
 
+# 这一节是上一版交付逐关验过、却在真机才爆的项：库能加载、符号齐全、对齐过，
+# 但编译时把四个 SGEMM 后端全关了（只留 RUY，而 RUY 只做 INT8 GEMM），
+# 第一次真翻译就抛 std::runtime_error("No SGEMM backend on CPU") 直接 abort。
+# 所以下面三项里任何一项不达标，就不要交付：真机拿到只会是一个会崩的库。
+echo "--- SGEMM 后端（硬判据，不对就是废品）---"
+echo "prefix 里的 oneDNN 静态库："
+ls -l "$PREFIX"/lib/libdnnl*.a 2>/dev/null || echo "  ❌ $PREFIX/lib 里没有 libdnnl.a"
+DNNL_REF_N=$("$BIN/llvm-nm" -u "$PREFIX/lib/libctranslate2.a" 2>/dev/null | grep -c dnnl || true)
+echo "  libctranslate2.a 引用的 dnnl_* 符号数 = ${DNNL_REF_N:-0}（应为几百，0 代表 WITH_DNNL 没生效）"
+DNNL_STR_N=$(strings -a "$SO" | grep -ci "dnnl\|onednn" || true)
+echo "  最终 .so 里的 oneDNN 字符串命中的行数 = ${DNNL_STR_N:-0}（应 > 0，strip 不影响）"
+SO_SIZE=$(stat -c%s "$SO")
+echo "  产物体积 = ${SO_SIZE} 字节（上一版无后端是 4738672，带 oneDNN 应明显变大）"
+if [ "${DNNL_STR_N:-0}" -lt 1 ] || [ "${DNNL_REF_N:-0}" -lt 1 ]; then
+  echo "❌ 无 SGEMM 后端，这个库上真机必崩 —— 停下，先查 cmake 选项与子模块"; exit 1
+fi
+
 cat <<'EOF'
 
 自检都过了就推回来（我会在本地 fetch 这个分支取 .so，不用你管 APK）：
   git checkout -B native-build
   git add -f app/src/main/jniLibs/arm64-v8a/libvtrans-mt.so
-  git commit -m "native: rebuild libvtrans-mt.so (CT2 3.24 + OPUS-MT pair model)"
+  git commit -m "native: rebuild libvtrans-mt.so with oneDNN SGEMM backend"
   git push -f origin native-build
 EOF
