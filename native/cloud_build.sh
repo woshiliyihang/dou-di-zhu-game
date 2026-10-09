@@ -21,7 +21,10 @@ JOBS="${JOBS:-8}"
 cd "$(dirname "$0")/.."   # 仓库根
 
 echo "==> 1/5 基础工具"
-if ! command -v cmake >/dev/null 2>&1; then
+if ! command -v cmake >/dev/null 2>&1 || ! command -v ninja >/dev/null 2>&1 \
+  || ! command -v file >/dev/null 2>&1 || ! command -v git >/dev/null 2>&1 \
+  || ! command -v unzip >/dev/null 2>&1 || ! command -v curl >/dev/null 2>&1 \
+  || ! command -v gcc >/dev/null 2>&1 || ! command -v g++ >/dev/null 2>&1; then
   sudo apt-get update -qq
   sudo apt-get install -y -qq cmake ninja-build git build-essential unzip curl file
 fi

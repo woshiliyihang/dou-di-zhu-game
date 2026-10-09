@@ -52,10 +52,7 @@ cmake -S "$SRC/ctranslate2" -B "$SRC/ctranslate2/build-$ABI" \
   -DOPENMP_RUNTIME=COMP \
   -DENABLE_CPU_DISPATCH=ON \
   -DCMAKE_INSTALL_PREFIX="$PREFIX"
-# third_party（eigen / ruy / cpu_features / cpuinfo / fast_float）挂在一个叫 deps
-# 的独立 target 上，不在 all 里。不先显式跑它，下一步 install 会直接报找不到头文件
-# （CT2 自己的 README 也是这么要求的，只是很容易看漏）。
-cmake --build "$SRC/ctranslate2/build-$ABI" -j"$JOBS" --target deps
+# CT2 v3.24.0 没有 deps 汇总 target；其 third_party 依赖随 install 的目标依赖图构建。
 cmake --build "$SRC/ctranslate2/build-$ABI" -j"$JOBS" --target install
 
 # libctranslate2.a 依赖 ruy 与 cpu_features，二者不会随 install 一起落盘，手动拷过去

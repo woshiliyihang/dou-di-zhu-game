@@ -32,8 +32,8 @@ CTranslate2 编译约 10~20 分钟，属正常，不要因为慢就中断。
 
 - **CTranslate2 必须是 3.x（钉 v3.24.0），绝对不要升到 4.x。**
   `app/src/main/cpp/mt_engine.cpp` 用的是 3.x 独有的构造签名
-  `Translator(model_dir, Device, ComputeType, device_indices, max_queued_batches, ReplicaPoolConfig)`，
-  而 4.0 把 `ReplicaPoolConfig` 和 `max_queued_batches` 整个删了，升版本必然编译失败。
+  `Translator(model_dir, Device, ComputeType, device_indices, ReplicaPoolConfig)`，
+  队列上限通过 `ReplicaPoolConfig.max_queued_batches` 设置；4.0 移除了该配置，升版本可能编译失败。
 - **不要改 `mt_engine.cpp` 的业务逻辑。** 只有两种情况允许动它，且必须把 diff 贴回来：
   1. CT2/sentencepiece 头文件里的 API 名字与 3.24 实际有出入（改名、挪命名空间）；
   2. 编译需要补 `#include`。
@@ -50,9 +50,9 @@ CTranslate2 编译约 10~20 分钟，属正常，不要因为慢就中断。
 
 - 报 `ReplicaPoolConfig` / `max_queued_batches` / `no member named` → 八成是源码不是 3.24，
   用 `git -C /tmp/src/ctranslate2 describe --tags` 确认，必要时重 clone 到 v3.24.0。
-- 报找不到 `Eigen/Dense`、`ruy/...`、`cpu_features/...` 头 → 是 CT2 的 `deps` target 没跑，
-  确认 `native/build_android.sh` 里 configure 之后有
-  `cmake --build ... --target deps` 这一行（脚本已补上，别删）。
+- 报找不到 `Eigen/Dense`、`ruy/...`、`cpu_features/...` 头 → 检查 CT2 子模块是否完整，
+  并确认 `native/build_android.sh` 对配置后的目录执行了 `cmake --build ... --target install`。
+  v3.24.0 没有名为 `deps` 的汇总 target，其第三方库由 `install` 的依赖图构建。
 - 链接报 `undefined reference to GOMP_xxx` → OpenMP 被排到了库之前，检查
   `-fopenmp -static-openmp` 是否还在 `--end-group` 之后。
 - 报 `liblog.so` 相关（`__android_log_print`）→ `target_link_libraries(vtrans-mt PRIVATE log android)` 被挪动了。
@@ -79,7 +79,7 @@ ls -l "$SO"
 |---|---|
 | `NEEDED` | 只有 `liblog.so libandroid.so libm.so libdl.so libc.so`，出现其它 `.so` 就是静态没吃干净 |
 | LOAD 段 `Align` | `0x4000`（16384），Android 15+ 强制要求 |
-| JNI 符号 | 7 个 `Java_com_example_vtrans_MtEngine_*` |
+| JNI 符号 | 7 个 `Java_com_example_vtrans_pipeline_MtEngine_*` |
 | `ctranslate2` 符号数 | 上千（旧包实测 2172），接近 0 说明根本没链进去 |
 | 文件大小 | 几 MB 到十几 MB 都算正常 |
 
@@ -152,3 +152,12 @@ git push -f origin native-build
 
 如果第 5 节做过 Python 侧验证，请把它打印的那两行（`ZH:` 和耗时对比）一并写进提交信息或
 贴回对话——委托人要用它判断是否值得直接切默认模型。
+
+## 7. 本次编译记录（2026-10-09）
+
+- 工具链：Android NDK r26d；CTranslate2 v3.24.0；SentencePiece v0.2.0。
+- 目标 ABI：`arm64-v8a`。
+- 产物：`app/src/main/jniLibs/arm64-v8a/libvtrans-mt.so`，4,738,672 字节。
+- 静态库：`libctranslate2.a` 80,428,272 字节；`libsentencepiece.a` 25,704,662 字节；均已静态链接进 JNI so。
+- 完整执行 `bash native/cloud_build.sh` 成功。`NEEDED` 仅有 `liblog.so`、`libandroid.so`、`libm.so`、`libdl.so`、`libc.so`；所有 `LOAD` 段对齐为 `0x4000`；导出 7 个 `Java_com_example_vtrans_pipeline_MtEngine_*` 符号和 2035 个 `ctranslate2` 符号。
+- 未执行第 5 节的 Hugging Face 模型下载、实际翻译质量检查及 NLLB/OPUS-MT 速度对比；本记录只证明交叉编译与 ELF 自检通过。
