@@ -94,10 +94,18 @@ public final class VoicePreprocessor {
     private double gateGain = 1.0;
     private double agcGain = 1.0;
     private int calib;              // 剩余标定采样数
+    /**
+     * VAD 反馈回路：sherpa-onnx 的 Silero 模型判定比本类的包络可靠得多，
+     * 将它的结果传进来，AGC 只在它认为「正在说话」时才拉高。避免
+     * 环境低到中等强度的持续噪声（空调 / 键盘）让包络跨过 noiseFloor×2.5 就能把
+     * AGC 一路抬到 +21dB，然后反过来骗 VAD。
+     */
+    private volatile boolean vadActive;
 
     // ---------- 观测值（供日志/状态用，音频线程读写） ----------
     private double inPeak;
     private double outPeak;         // 送 ASR 那一路的峰值（电平表/诊断看这个才有意义）
+    private int limitHits;          // 本次窗口内限幅拐点被跨越的次数
 
     public VoicePreprocessor(boolean hpf, boolean ns, boolean agc) {
         this.doHpf = hpf;
@@ -131,6 +139,7 @@ public final class VoicePreprocessor {
     public void process(float[] vadIo, float[] asrOut, int len) {
         inPeak = 0;
         outPeak = 0;
+        int hitsThisFrame = 0;
         for (int i = 0; i < len; i++) {
             double x = vadIo[i];
             if (doHpf) x = hpf(x);
@@ -168,11 +177,13 @@ public final class VoicePreprocessor {
                 }
             }
 
-            // ---------- AGC：只看信噪比，不依赖 active ----------
-            // 标定期冻结在 1，避免拿未校准的噪声底做决定；标定结束后 12ms 就能抬起来。
+            // ---------- AGC：SNR 目测 + VAD 反馈 + 不依赖包络门控 ----------
+            // 标定期冻结在 1； Vad 说没说话时 target=1，防止把噪声越放越大。
             if (doAgc) {
-                if (calibrating) {
-                    agcGain = 1.0;
+                if (calibrating || !vadActive) {
+                    // VAD 反馈回路：不在说话→逐逐逐回到 1.0（采用 AGC_FALL 释放常数）
+                    double c = 1.0 > agcGain ? AGC_FALL : AGC_FALL;
+                    agcGain += (1.0 - agcGain) * c;
                 } else {
                     double target = 1.0;
                     if (env > noiseFloor * AGC_SNR_RATIO && env < AGC_TARGET_ABS) {
@@ -190,6 +201,7 @@ public final class VoicePreprocessor {
             double asrY = limiter(x * agc);
             double aasr = Math.abs(asrY);
             if (aasr > outPeak) outPeak = aasr;
+            if (Math.abs(x * agc) > LIMIT_SOFT) hitsThisFrame++;
             asrOut[i] = (float) asrY;
 
             // ---------- VAD 路：额外乘门控增益，压停顿期底噪 ----------
@@ -202,6 +214,7 @@ public final class VoicePreprocessor {
             }
             vadIo[i] = (float) limiter(x * gateGain * agc);
         }
+        limitHits += hitsThisFrame;
     }
 
     /** 新一句 / 开始录音时重置，避免把上一段的状态带进来。 */
@@ -216,6 +229,7 @@ public final class VoicePreprocessor {
         calib = CALIB_SAMPLES;
         inPeak = 0;
         outPeak = 0;
+        limitHits = 0;
     }
 
     private double hpf(double x) {
@@ -267,5 +281,36 @@ public final class VoicePreprocessor {
     /** 自适应噪声底（dBFS），诊断用。 */
     public double noiseFloorDb() {
         return 20 * Math.log10(Math.max(noiseFloor, 1e-9));
+    }
+
+    /**
+     * 外部（sherpa-onnx VAD）反馈当前是不是在说话。
+     * AGC 只在 true 时拉高，false 时逐逐回到 1.0，防止把环境噪声越放越大。
+     */
+    public void setVadActive(boolean active) {
+        this.vadActive = active;
+    }
+
+    /** 当前 VAD 反馈缓存；重建处理链时拷给新实例，避免一瞬丢失上下文。 */
+    public boolean vadActiveSnapshot() {
+        return vadActive;
+    }
+
+    /** 当前短时包络相对噪声底的信噪比（dB），诊断用。 */
+    public double snrDb() {
+        return 20 * Math.log10(Math.max(env, 1e-9)
+                / Math.max(noiseFloor, 1e-9));
+    }
+
+    /** 当前软限幅拐点被跨越的采样数（自上次 {@link #consumeLimitHits()} 以采累计）。 */
+    public int limitHits() {
+        return limitHits;
+    }
+
+    /** 读后归零，给周期日志用。 */
+    public int consumeLimitHits() {
+        int h = limitHits;
+        limitHits = 0;
+        return h;
     }
 }

@@ -592,6 +592,10 @@ public class TranslateService extends Service {
                     public void onSpeechStateChanged(boolean speaking) {
                         // 增量预览的节奏由定时器统一控制，这里只更新通知文案
                         if (speaking) updateNotification("正在聆听…");
+                        // VAD 反馈回路：把“现在是不是在说话”回传给处理链，AGC 只在
+                        // 说话时拉高。避免环境噪声把 AGC 一直拉到 +21dB 又反过来骗 VAD。
+                        AudioCapture c = capture;
+                        if (c != null) c.setVadSpeaking(speaking);
                     }
                 });
 
@@ -623,6 +627,7 @@ public class TranslateService extends Service {
         });
 
         capture.setMicBoostDb(prefs.micBoostDb());
+        capture.setAgcPolicy(prefs.agcPolicy());
         capture.setCaptureRateHz(prefs.captureRateHz());
         acquireWakeLock();
         long captureStartedAt = android.os.SystemClock.elapsedRealtime();

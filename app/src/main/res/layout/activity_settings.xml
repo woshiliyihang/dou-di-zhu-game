@@ -60,5 +60,71 @@
             android:text="@string/mic_gain_hint"
             android:textColor="@color/text_secondary"
             android:textSize="12sp" />
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="20dp"
+            android:text="@string/settings_agc_policy"
+            android:textColor="@color/text_primary"
+            android:textSize="16sp"
+            android:textStyle="bold" />
+
+        <RadioGroup
+            android:id="@+id/rgAgcPolicy"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="6dp"
+            android:orientation="vertical">
+
+            <RadioButton
+                android:id="@+id/rbAgcAuto"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:checked="true"
+                android:text="@string/agc_auto"
+                android:textColor="@color/text_primary" />
+
+            <RadioButton
+                android:id="@+id/rbAgcForceOn"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="@string/agc_force_on"
+                android:textColor="@color/text_primary" />
+
+            <RadioButton
+                android:id="@+id/rbAgcForceOff"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="@string/agc_force_off"
+                android:textColor="@color/text_primary" />
+        </RadioGroup>
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="12dp"
+            android:text="@string/agc_policy_hint"
+            android:textColor="@color/text_secondary"
+            android:textSize="12sp" />
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="20dp"
+            android:text="@string/settings_live_noise"
+            android:textColor="@color/text_primary"
+            android:textSize="16sp"
+            android:textStyle="bold" />
+
+        <TextView
+            android:id="@+id/tvLiveNoise"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="6dp"
+            android:text="@string/live_noise_idle"
+            android:textColor="@color/text_secondary"
+            android:textSize="13sp"
+            android:fontFamily="monospace" />
     </LinearLayout>
 </ScrollView>

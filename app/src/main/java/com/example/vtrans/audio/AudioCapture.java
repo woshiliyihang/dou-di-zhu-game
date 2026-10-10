@@ -8,6 +8,8 @@ import android.media.MediaRecorder;
 import android.os.Process;
 import android.util.Log;
 
+import com.example.vtrans.util.Prefs;
+
 import java.util.Locale;
 
 /**
@@ -50,8 +52,22 @@ public final class AudioCapture {
     private static final int LEVEL_EVERY_FRAMES = 12;
     /** 送识别的峰值连续低于这个电平（≈-24dBFS）两个窗口 → 强制开软件 AGC */
     private static final double AGC_RESCUE_PEAK = 0.06;
+    /**
+     * SNR 兜底阈值：实际声包与噪声底的信噪比长期低于此值（dB）就不应该拉 AGC，
+     * 因为此时麦克风里基本没人在说话。相比单看峰值，SNR 能避免
+     * “环境很吵但峰值也高”→ AGC 把噪声也放的更高→ VAD 误判的链式反应。
+     */
+    private static final double AGC_RESCUE_SNR_DB = 15.0;
     /** AudioRecord.ERROR_DEAD_OBJECT 是 API 24+ 才有，手写常量兼容低版本 */
     private static final int ERROR_DEAD_OBJECT = -6;
+
+    // ---------- 周期间快照（给设置页实时噪声底用，同进程下直接读静态字段） ----------
+    /** 最近一次 [gain-chain] 日志的噪声底 dBFS；NaN 表示尚未采样。 */
+    public static volatile double lastNoiseFloorDb = Double.NaN;
+    /** 最近一次 [gain-chain] 日志的 SNR dB。 */
+    public static volatile double lastSnrDb = Double.NaN;
+    /** 最近一次 [gain-chain] 日志的 AGC 当前增益 dB。 */
+    public static volatile double lastAgcGainDb = Double.NaN;
 
     public interface Sink {
         /**
@@ -90,6 +106,15 @@ public final class AudioCapture {
     private int micBoostDb;
     private float micGain = 1.0f;
     private int captureRate = SAMPLE_RATE;
+    /**
+     * AGC 策略：auto / force-on / force-off。
+     * <ul>
+     *   <li>auto：保留现有“系统 AGC 不行时软件兜底”行为</li>
+     *   <li>force-on：无论系统报什么，软件 AGC 强制启用</li>
+     *   <li>force-off：禁用软件 AGC 兼禁用兜底；防止噪声环境里 AGC 把噪声越放越大</li>
+     * </ul>
+     */
+    private volatile String agcPolicy = Prefs.AGC_AUTO;
 
     // 软件链各段开关：AGC 电平兜底时要按原样重建处理链，只把 AGC 那一段打开
     private boolean softHpf = true;
@@ -112,6 +137,17 @@ public final class AudioCapture {
     public void setMicBoostDb(int db) {
         this.micBoostDb = db;
         this.micGain = (float) Math.pow(10.0, Math.max(0, Math.min(30, db)) / 20.0);
+    }
+
+    /** 设置 AGC 策略；{@link Prefs#AGC_AUTO}/{@link Prefs#AGC_FORCE_ON}/{@link Prefs#AGC_FORCE_OFF}。 */
+    public void setAgcPolicy(String policy) {
+        this.agcPolicy = policy == null ? Prefs.AGC_AUTO : policy;
+    }
+
+    /** 将 sherpa VAD 的“现在是不是在说话”回传给处理链，AGC 只在说话时拉高。 */
+    public void setVadSpeaking(boolean speaking) {
+        VoicePreprocessor p = pre;
+        if (p != null) p.setVadActive(speaking);
     }
 
     /** 采集采样率：16000（默认）或 48000。必须在 {@link #start()} 之前调用。 */
@@ -241,6 +277,12 @@ public final class AudioCapture {
         }
         boolean softwareNs = "software".equals(mode) || (wantFx && !fx.nsOn);
         boolean softwareAgc = "software".equals(mode) || (wantFx && !fx.agcOn);
+        // AGC 策略优先于默认推导：force-on 强制开，force-off 强制关
+        if (Prefs.AGC_FORCE_ON.equals(agcPolicy)) {
+            softwareAgc = true;
+        } else if (Prefs.AGC_FORCE_OFF.equals(agcPolicy)) {
+            softwareAgc = false;
+        }
         softHpf = true;
         softNs = softwareNs;
         softAgc = softwareAgc;
@@ -258,6 +300,7 @@ public final class AudioCapture {
                 .append(" 系统AGC=").append(fx.agcOn ? "开" : "关")
                 .append(" | 软件补: HPF=开 NS=").append(softwareNs ? "开" : "关")
                 .append(" AGC=").append(softwareAgc ? "开" : "关")
+                .append("(policy=").append(agcPolicy).append(")")
                 .append(" | 识别路不加门控（门控只走 VAD 路）");
         if (wantFx && !fx.aecOn) {
             sb.append(" | 系统 AEC 未能启用：外放播报译文时可能被本机麦克风拾取，建议插耳机播报"
@@ -370,13 +413,23 @@ public final class AudioCapture {
 
                 if (++frameCount % LOG_EVERY_FRAMES == 0) {
                     maybeForceSoftwareAgc();
+                    // 分阶段日志：一行信息不够定位噪声链问题；拆成
+                    // [gain-chain] 前缀方便 grep，并把 noiseFloor/snr/limit 都报出来。
+                    VoicePreprocessor snap = pre;   // pre 可能被兜底重建，重新取一次
+                    int hits = snap == null ? 0 : snap.consumeLimitHits();
+                    double nf = snap == null ? -100.0 : snap.noiseFloorDb();
+                    double snr = snap == null ? 0.0 : snap.snrDb();
+                    double ag = snap == null ? 0.0 : snap.agcGainDb();
+                    lastNoiseFloorDb = nf;
+                    lastSnrDb = snr;
+                    lastAgcGainDb = ag;
                     Log.i(TAG, String.format(Locale.ROOT,
-                            "输入峰值 %.0fdBFS 送识别峰值 %.0fdBFS AGC %.1fdB 门控%s%s",
+                            "[gain-chain] in=%.1fdBFS out=%.1fdBFS noise=%.1fdBFS snr=%.1fdB "
+                                    + "agc=%.1fdB gate=%s limit_hits=%d",
                             dbfs(inLevelMax), dbfs(outPeak),
-                            p == null ? 0 : p.agcGainDb(),
-                            p == null ? "无(处理链已关)" : (p.gateOpen() ? "开" : "关"),
-                            p == null ? "" : String.format(Locale.ROOT, " 噪声底 %.0fdBFS",
-                                    p.noiseFloorDb())));
+                            nf, snr, ag,
+                            snap == null ? "na" : (snap.gateOpen() ? "open" : "shut"),
+                            hits));
                     inLevelMax = 0;
                 }
             }
@@ -398,26 +451,54 @@ public final class AudioCapture {
 
     /**
      * 电平兜底：系统 AGC 报「已启用」并不等于真在抬增益（高通平台上识别音源
-     * 常见只挂名字不出力），老实现一看 fx.agcOn 为真就跳过软件 AGC，轻声场景下
-     * 等于两边都不做功。所以改成按实测电平兼底：送识别的峰值连续两个 5s 窗口
-     * 都不足 ≈-24dBFS，就重建处理链并强制打开软件 AGC。
-     * <p>只在录音线程调用（frameCount 逢窗口）。标定期峰值本来就低，因此要连输两次才动手。
+     * 常见只挂名字不出力）。旧实现只看峰值：环境很吵时峰值高→不兜底，但
+     * 实际信噪比很低，VAD 被噪声骗得根本不会判停。
+     *
+     * <p>现在同时看两个量：
+     * <ul>
+     *   <li>峰值 < -24dBFS → 信号太轻，需要兜底（传统场景）</li>
+     *   <li>信噪比 < 15dB → 噪声与信号同幅，拉 AGC 只会把噪声也拉高；此时不兜底</li>
+     * </ul>
+     * 另外：{@code agcPolicy=force-off} 直接短路；{@code force-on} 时不管三七二十一
+     * 重建处理链并强制开软件 AGC。
      */
     private void maybeForceSoftwareAgc() {
         double w = windowMaxOut;
         windowMaxOut = 0;
         VoicePreprocessor p = pre;
-        if (p == null || agcRescued || p.agcEnabled()) return;
-        if (w >= AGC_RESCUE_PEAK) {
+        if (p == null) return;
+
+        if (Prefs.AGC_FORCE_OFF.equals(agcPolicy)) {
+            return;  // 用户强制关，直接不做兜底
+        }
+        if (Prefs.AGC_FORCE_ON.equals(agcPolicy)) {
+            if (!p.agcEnabled()) {
+                pre = new VoicePreprocessor(softHpf, softNs, true);
+                pre.setVadActive(p.vadActiveSnapshot());
+                summary = summary + " | policy=force-on，已重建链启用软件 AGC";
+                Log.i(TAG, "[gain-chain] force-on 重建处理链，软件 AGC 启用");
+            }
+            return;
+        }
+
+        if (agcRescued || p.agcEnabled()) return;
+        double snr = p.snrDb();
+        boolean tooQuiet = w < AGC_RESCUE_PEAK;
+        boolean snrOk = snr >= AGC_RESCUE_SNR_DB;
+        if (!tooQuiet || !snrOk) {
+            // 峰值够高 → 不需要兜底；信噪比低 → 兜底也没用，不启
             quietWindows = 0;
             return;
         }
         if (++quietWindows < 2) return;
         agcRescued = true;
+        VoicePreprocessor old = pre;
         pre = new VoicePreprocessor(softHpf, softNs, true);
-        summary = summary + " | 电平过低，已强制启用软件 AGC 兜底";
-        Log.i(TAG, "送识别峰值长期只有 " + String.format(Locale.ROOT, "%.0f", dbfs(w))
-                + "dBFS：系统 AGC 报开启但很可能未生效，已强制启用软件 AGC");
+        pre.setVadActive(old.vadActiveSnapshot());
+        summary = summary + " | 电平过低且 SNR 健康，已强制启用软件 AGC 兜底";
+        Log.i(TAG, String.format(Locale.ROOT,
+                "[gain-chain] 兜底启动：送识别峰值 %.0fdBFS SNR %.1fdB（系统 AGC 很可能未生效）",
+                dbfs(w), snr));
     }
 
     public synchronized void stop() {

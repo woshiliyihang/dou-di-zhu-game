@@ -28,6 +28,11 @@ public final class Prefs {
     /** 收音增益（远场增强），单位 dB：0 / 6 / 12 / 18 */
     private static final String K_MIC_BOOST_DB = "mic_boost_db";
     /**
+     * AGC 策略：auto / force-on / force-off，见 {@link #AGC_AUTO} 等常量。
+     * 改动在下次点「开始翻译」时生效（与 micBoost 一致）。
+     */
+    private static final String K_AGC_POLICY = "agc_policy";
+    /**
      * 采集采样率：16000（默认）/ 48000。
      * <p>48k 采集后软件抽取到 16k 再送模型。部分 ROM 在 16k 直通通路上会限带/强降噪，
      * 高采样率通路能拿到更多原始信息；不是所有机器都给 48k，打不开会自动退回 16k。
@@ -56,6 +61,13 @@ public final class Prefs {
     public static final String AUDIO_SOFTWARE = "software";
     /** 关闭：输出原始信号 */
     public static final String AUDIO_OFF = "off";
+
+    /** 默认：系统 AGC 报关或实际不生效时才启动软件 AGC */
+    public static final String AGC_AUTO = "auto";
+    /** 无论系统报什么，都强制启用软件 AGC */
+    public static final String AGC_FORCE_ON = "force-on";
+    /** 强制关闭软件 AGC 与兜底，预防噪声环境把 VAD 骗到底 */
+    public static final String AGC_FORCE_OFF = "force-off";
 
     private final SharedPreferences sp;
 
@@ -111,6 +123,18 @@ public final class Prefs {
 
     public void setMicBoostDb(int v) {
         sp.edit().putInt(K_MIC_BOOST_DB, Math.max(0, Math.min(18, v))).apply();
+    }
+
+    /** AGC 策略，只会返回三个常量之一。 */
+    public String agcPolicy() {
+        String v = sp.getString(K_AGC_POLICY, AGC_AUTO);
+        if (AGC_FORCE_ON.equals(v) || AGC_FORCE_OFF.equals(v)) return v;
+        return AGC_AUTO;
+    }
+
+    public void setAgcPolicy(String v) {
+        String safe = AGC_FORCE_ON.equals(v) || AGC_FORCE_OFF.equals(v) ? v : AGC_AUTO;
+        sp.edit().putString(K_AGC_POLICY, safe).apply();
     }
 
     /** 采集采样率 Hz，只认 16000 / 48000，其他值按默认处 16k 处理。 */

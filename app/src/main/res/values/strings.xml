@@ -32,4 +32,13 @@
     <string name="mic_far">远场尝试：+12 dB</string>
     <string name="mic_very_far">最大增益：+18 dB</string>
     <string name="mic_gain_hint">增益会同时放大环境噪声，实际拾音距离取决于手机麦克风、说话音量和环境；如有失真或噪声过大，请调低。</string>
+
+    <string name="settings_agc_policy">AGC 策略</string>
+    <string name="agc_auto">自动（默认）：系统 AGC 不生效时才启动软件 AGC</string>
+    <string name="agc_force_on">强制启用：无论系统报什么，都拉软件 AGC</string>
+    <string name="agc_force_off">强制关闭：防止噪声环境把 VAD 骗到底</string>
+    <string name="agc_policy_hint">噪声环境下 VAD 长时间不判停、或 ASR 看起来“卡住”，可选“强制关闭”一键断开自动增益。</string>
+
+    <string name="settings_live_noise">实时噪声情况（仅当翻译运行时刷新）</string>
+    <string name="live_noise_idle">未采样——请先开始一次翻译后回到本页</string>
 </resources>
