@@ -28,8 +28,9 @@ public final class VadSegmenter {
     private static final String TAG = "VadSegmenter";
     public static final int SAMPLE_RATE = 16000;
 
-    /** 连续说话超过这个时长就硬切，避免一口气说话把显存/内存吃满 */
-    private static final int MAX_SPEECH_SAMPLES = 20 * SAMPLE_RATE;
+    /** 连续说话超过这个时长就硬切，避免一口气说话把显存/内存吃满；
+     *  也避免 VAD 因噪声/AGC 不判停时用户长时间看不到输出（旧值 20s 会卡太久）*/
+    private static final int MAX_SPEECH_SAMPLES = 8 * SAMPLE_RATE;
 
     /** 静音期在缓冲里保留的前缀：VAD 起说判定有滞后，这段就是用来补字头的 */
     private static final int SILENCE_KEEP = (int) (0.6 * SAMPLE_RATE);
@@ -66,6 +67,8 @@ public final class VadSegmenter {
     private float[] buf = new float[8 * SAMPLE_RATE];
     private int len;
     private boolean speaking;
+    /** 当前这句何时开始说话（elapsedRealtime ms）；未说话时为 0 */
+    private volatile long speakingStartAtMs;
 
     public VadSegmenter(String vadModelPath, int numThreads, String provider,
                         Callback callback) {
@@ -73,8 +76,10 @@ public final class VadSegmenter {
 
         VadModelConfig cfg = new VadModelConfig();
         cfg.getSileroVadModelConfig().setModel(vadModelPath);
-        // 0.5 → 0.40：轻声场景下 Silero 的输出概率本身就偏低，原门限要求很高置信才触发。
-        cfg.getSileroVadModelConfig().setThreshold(0.40f);
+        // 0.40 → 0.55：日志实测发现 AGC 拉高 20dB 后，背景噪声足以长期跨过 0.40，
+        // VAD 20s+ 不判停，导致 ASR 看起来卡住。提至 0.55 让噪声不再当语音，
+        // 轻声场景交给 AGC/micBoost 保护。0.6s 前缀不变，不会吃字头。
+        cfg.getSileroVadModelConfig().setThreshold(0.55f);
         // 判停等待：0.35 → 0.50 曾经是为了兑现门限放宽（句间停顿不被误切），
         // 但它给每一句都加了半秒钟的「说完后干等」，是「不实时」的第一大来源。
         // 现在字头保护已由识别路缓冲的 0.6s 前缀负责，与静音确认时长无关，所以回到
@@ -139,6 +144,10 @@ public final class VadSegmenter {
                 speaking = detected;
                 stateChanged = true;
                 newState = detected;
+                // 开说时刷时间戳，让上层能判断“已说到句尾”——避开 partial 与 final 在
+                // asrExec 上的争抢（日志中 queue_ms=155/188 都是这么来的）。
+                speakingStartAtMs = detected
+                        ? android.os.SystemClock.elapsedRealtime() : 0L;
             }
             if (!detected && len > 0 && vad.empty()) {
                 // 起说前的静音前缀不该堆在缓冲里，但也必须留足一段给字头补偿
@@ -176,6 +185,16 @@ public final class VadSegmenter {
 
     public synchronized boolean isSpeaking() {
         return speaking;
+    }
+
+    /**
+     * 当前这句已经说了多久（ms）。未说话时返回 0。
+     * 上层用它判断“接近句尾”，从而不再起新的增量预览。
+     */
+    public long speakingDurationMs() {
+        long start = speakingStartAtMs;
+        if (start == 0L) return 0L;
+        return android.os.SystemClock.elapsedRealtime() - start;
     }
 
     /** 一句话结束后复位，准备下一句 */

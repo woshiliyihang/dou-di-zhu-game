@@ -25,7 +25,7 @@ import com.example.vtrans.audio.TtsSpeaker;
 import com.example.vtrans.model.ModelManager;
 import com.example.vtrans.model.ModelsManifest;
 import com.example.vtrans.pipeline.AsrEngine;
-import com.example.vtrans.pipeline.MtEngine;
+import com.example.vtrans.pipeline.LlamaApiTranslator;
 import com.example.vtrans.pipeline.SentenceSplitter;
 import com.example.vtrans.pipeline.StreamingAsr;
 import com.example.vtrans.pipeline.VadSegmenter;
@@ -52,7 +52,7 @@ import java.util.concurrent.atomic.AtomicInteger;
  *
  * <pre>
  * AudioCapture(20ms 帧) → Silero VAD → SenseVoice(English) → SentenceSplitter
- *      → MtEngine/OPUS-MT (English→Chinese) → 广播给 UI
+ *      → LlamaApiTranslator (llama.cpp OpenAI API, English→Chinese) → 广播给 UI
  * </pre>
  *
  * <p>为什么放服务里：翻译要在息屏、切后台时继续，Activity 被回收不能影响链路。
@@ -95,7 +95,7 @@ public class TranslateService extends Service {
     private AudioCapture capture;
     private VadSegmenter vad;
     private AsrEngine asr;
-    private MtEngine mt;
+    private LlamaApiTranslator translator;
     private volatile boolean translationModelReady;
     private volatile String translationModelError;
     private TtsSpeaker tts;
@@ -125,9 +125,9 @@ public class TranslateService extends Service {
      * 残句长到这个程度就立刻翻，别再等拼接：等拼接换回来的是句子更连贯，
      * 代价是用户干等着，速度优先时不划算。
      */
-    private static final int TAIL_KEEP_MIN_CHARS = 4;
-    /** 攒着的碎句最多等多久。原来 1.2s，实测那 1.2s 是全链路里最没道理的一段 */
-    private static final long TAIL_FLUSH_DELAY_MS = 400;
+    private static final int TAIL_KEEP_MIN_CHARS = 3;
+    /** 攒着的碎句最多等多久。原 400ms 实测无必要：降为 150ms 避免干等 */
+    private static final long TAIL_FLUSH_DELAY_MS = 150;
     private volatile long lastSegmentAtMs;
     private volatile String lastSegLang;
 
@@ -317,8 +317,8 @@ public class TranslateService extends Service {
 
             String message = translationModelReady ? "正在聆听：英语 → 中文"
                     : translationModelError != null
-                            ? "英→中翻译模型加载失败，请重新启动"
-                            : "正在聆听（正在准备英→中翻译模型）…";
+                            ? "翻译 API 加载失败，请检查 llama.cpp 服务是否启动"
+                            : "正在聆听（正在准备翻译 API）…";
             broadcastStatus("running", message);
             updateNotification("正在聆听…");
         } catch (Throwable t) {
@@ -332,17 +332,17 @@ public class TranslateService extends Service {
         }
     }
 
-    /** Warm up the translator without blocking audio capture. */
+    /** Warm up the translator API without blocking audio capture. */
     private void warmUpEngines() {
-        final MtEngine engine = mt;
+        final LlamaApiTranslator engine = translator;
         if (engine != null) {
             try {
                 mtExec.execute(() -> {
                     long t0 = android.os.SystemClock.elapsedRealtime();
                     try {
-                        String result = engine.translate("Could you help me?", "en", "zh");
+                        String result = engine.translate("Could you help me?");
                         if (result == null || result.trim().isEmpty()) {
-                            throw new IllegalStateException("英中翻译预热返回空结果");
+                            throw new IllegalStateException("llama.cpp API 预热返回空结果");
                         }
                         Log.i(PERF_TAG, "stage=mt_warmup status=ok elapsed_ms="
                                 + (android.os.SystemClock.elapsedRealtime() - t0));
@@ -352,7 +352,7 @@ public class TranslateService extends Service {
                         Log.e(PERF_TAG, "stage=mt_warmup status=error elapsed_ms="
                                 + (android.os.SystemClock.elapsedRealtime() - t0), t);
                         if (running) {
-                            broadcastStatus("error", "英→中翻译预热失败：" + t.getMessage());
+                            broadcastStatus("error", "翻译 API 预热失败：" + t.getMessage());
                         }
                     }
                 });
@@ -388,29 +388,13 @@ public class TranslateService extends Service {
     }
 
     private void loadEngines(String provider) {
-        long mtLoadStarted = android.os.SystemClock.elapsedRealtime();
-        unpackIfNeeded(ModelsManifest.OPUS_MT_EN_ZH);
-        try {
-            mt = MtEngine.create(models.resolve("opus-mt-en-zh").getAbsolutePath(),
-                    Math.min(2, Runtime.getRuntime().availableProcessors()), 1);
-        } catch (RuntimeException | Error t) {
-            Log.e(PERF_TAG, "stage=mt_load status=error elapsed_ms="
-                    + (android.os.SystemClock.elapsedRealtime() - mtLoadStarted), t);
-            throw t;
-        }
-        if (mt == null) {
-            translationModelError = "CTranslate2 无法加载内置 OPUS-MT 模型（nativeInit 返回空句柄）";
-            Log.e(PERF_TAG, "stage=mt_load status=error elapsed_ms="
-                    + (android.os.SystemClock.elapsedRealtime() - mtLoadStarted)
-                    + " reason=" + translationModelError);
-            throw new IllegalStateException(translationModelError);
-        }
+        // 翻译引擎：使用本机 llama.cpp OpenAI 兼容 API
+        String apiUrl = prefs.llamaApiUrl();
+        translator = new LlamaApiTranslator(apiUrl);
         translationModelReady = true;
         translationModelError = null;
-        Log.i(PERF_TAG, "stage=mt_load status=ok elapsed_ms="
-                + (android.os.SystemClock.elapsedRealtime() - mtLoadStarted)
-                + " model=opus-mt-en-zh-int8");
-        if (running) broadcastStatus("running", "英→中翻译模型已就绪");
+        Log.i(PERF_TAG, "stage=mt_load status=ok model=llama-cpp-api url=" + apiUrl);
+        if (running) broadcastStatus("running", "翻译 API 已就绪");
 
         unpackIfNeeded(ModelsManifest.SENSEVOICE);
         long asrLoadStarted = android.os.SystemClock.elapsedRealtime();
@@ -663,7 +647,17 @@ public class TranslateService extends Service {
         return Prefs.AUDIO_AUTO;
     }
 
-    /** 增量预览：只在均衡档做，且上一轮跑完才发下一轮 */
+    /**
+     * 增量预览：只在均衡档做，且上一轮跑完才发下一轮。
+     *
+     * <p>句尾附近不起新预览：已经说了 ≥ 6000ms 时，下一拍很可能
+     * 就是定稿，此时预览会卡在 asrExec 上把定稿拖慢 100–200ms（日志里 queue_ms
+     * 的 155/188 都来自这里）。阈值不能太低：VAD 长时间不判停时（例如噪声
+     * 环境），1500ms 会把预览完全消灭，用户体感就是「ASR 卡住」。6s 能护回大
+     * 多数长句，又不会到 VAD 8s 硬切区里白堆。</p>
+     */
+    private static final long PARTIAL_TAIL_SKIP_MS = 6000;
+
     private void maybePartial() {
         if (!running || !prefs.partialsEnabled() || vad == null) return;
         // 模型还没装好就别抢 asrExec（那段时间在排队的是攒下来的真音频）
@@ -671,6 +665,8 @@ public class TranslateService extends Service {
         // 有定稿在跑或排队：这一拍预览直接跳过。预览晚一拍没人看得出，
         // 定稿晚一拍就是「说完话干等」。
         if (finalQueued.get() > 0) return;
+        // 接近句尾：不再起新预览（已在跑的预览靠 native 自身不能打断）
+        if (vad.speakingDurationMs() >= PARTIAL_TAIL_SKIP_MS) return;
         if (!vad.isSpeaking() || !partialBusy.compareAndSet(false, true)) return;
         float[] samples = vad.snapshot();
         if (samples == null) { // 短于 VadSegmenter 的最小可认长度（含前缀）就没什么可认的
@@ -796,14 +792,14 @@ public class TranslateService extends Service {
         }
     }
 
-    /** 攒着的碎句兜底：到点还没被下一段接走就强制吐给 MT，保证译文一定会出现 */
+    /** 攒着的碎句兼底：到点还没被下一段接走就强制吐给 MT，保证译文一定会出现 */
     private final Runnable tailFlushGuard = this::maybeFlushTail;
 
     private void maybeFlushTail() {
         if (!running || splitter.pendingLength() == 0) return;
-        // 这一会儿又有新段进来了（新段自己会重新安排兜底），再等一小轮
-        if (System.currentTimeMillis() - lastSegmentAtMs < TAIL_FLUSH_DELAY_MS - 300) {
-            mainHandler.postDelayed(tailFlushGuard, 300);
+        // 这一会儿又有新段进来了（新段自己会重新安排兼底），再等一小轮
+        if (System.currentTimeMillis() - lastSegmentAtMs < TAIL_FLUSH_DELAY_MS - 50) {
+            mainHandler.postDelayed(tailFlushGuard, 50);
             return;
         }
         String lang = lastSegLang;
@@ -853,7 +849,7 @@ public class TranslateService extends Service {
 
     private void enqueueTranslation(List<String> sentences, String srcLang, long endpointAtNs) {
         if (sentences == null || sentences.isEmpty()) return;
-        final MtEngine engine = mt;
+        final LlamaApiTranslator engine = translator;
         if (engine == null) return;
         List<String> batch = null;
         for (String s : sentences) {
@@ -875,7 +871,7 @@ public class TranslateService extends Service {
                         long inferenceStartedAtNs = startedAtNs;
                         String out;
                         try {
-                            out = engine.translate(texts[i], "en", "zh");
+                            out = engine.translate(texts[i]);
                         } catch (RuntimeException | Error t) {
                             Log.e(PERF_TAG, "stage=translate status=error seq=" + sentenceSeq
                                     + " queue_ms=" + queuedMs + " input_chars="
@@ -886,7 +882,7 @@ public class TranslateService extends Service {
                         long ms = (completedAtNs - inferenceStartedAtNs) / 1_000_000L;
                         if (out == null) {
                             IllegalStateException error =
-                                    new IllegalStateException("CTranslate2 翻译返回空结果");
+                                    new IllegalStateException("llama.cpp 翻译 API 返回空结果");
                             Log.e(PERF_TAG, "stage=translate status=error seq=" + sentenceSeq
                                     + " queue_ms=" + queuedMs + " inference_ms=" + ms
                                     + " input_chars=" + texts[i].length(), error);
@@ -1167,20 +1163,17 @@ public class TranslateService extends Service {
             oldAsr.release();
         }
 
-        MtEngine oldMt = mt;
-        mt = null;
+        LlamaApiTranslator oldMt = translator;
+        translator = null;
         if (mtExec != null) {
             try {
                 mtExec.execute(() -> {
-                    if (oldMt != null) oldMt.destroy();
+                    // LlamaApiTranslator 无需显式释放，只清空引用即可
                 });
             } catch (RejectedExecutionException ignored) {
-                if (oldMt != null) oldMt.destroy();
             }
             mtExec.shutdown();
             mtExec = null;
-        } else if (oldMt != null) {
-            oldMt.destroy();
         }
 
         // 取消尚未触发的通知刷新，别让服务停了还弹一条 ongoing 通知

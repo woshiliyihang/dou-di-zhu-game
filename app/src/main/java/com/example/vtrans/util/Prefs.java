@@ -19,6 +19,8 @@ public final class Prefs {
     private static final String K_MT_THREADS = "mt_threads";
     /** MT beam：1 或 4 */
     private static final String K_MT_BEAM = "mt_beam";
+    /** llama.cpp OpenAI 兼容 API 地址（本机部署，默认 http://127.0.0.1:18080） */
+    private static final String K_LLAMA_API_URL = "llama_api_url";
     /** 增量预览间隔 ms */
     private static final String K_PARTIAL_INTERVAL = "partial_interval";
     /** 基准测试测出来的最佳 provider */
@@ -157,6 +159,15 @@ public final class Prefs {
     /** 高精档 beam=4，均衡档 beam=1 */
     public int beamForTier() {
         return TIER_QUALITY.equals(tier()) ? 4 : 1;
+    }
+
+    /** llama.cpp OpenAI 兼容 API 基地址，默认本机 18080 端口 */
+    public String llamaApiUrl() {
+        return sp.getString(K_LLAMA_API_URL, "http://127.0.0.1:18080");
+    }
+
+    public void setLlamaApiUrl(String v) {
+        sp.edit().putString(K_LLAMA_API_URL, v).apply();
     }
 
     static int defaultThreads() {

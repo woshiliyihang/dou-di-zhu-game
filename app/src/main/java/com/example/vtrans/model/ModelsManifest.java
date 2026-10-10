@@ -5,7 +5,7 @@ package com.example.vtrans.model;
  *
  * <p>语音识别模型随 APK 一起打包在 <code>assets/models/</code> 下（见 app/build.gradle
  * 的 noCompress 配置），首次启动时由 {@link ModelManager} 解包到 app 私有目录。
- * 英→中 CTranslate2 int8 翻译模型也随 APK 打包，首次运行时解包到应用私有目录。
+ * 翻译功能已由原来的 OPUS-MT 改为通过本机 llama.cpp OpenAI 兼容 API 实现。
  *
  * <p><code>files</code> 是相对路径，既表示解包后的位置（相对 modelsDir），
  * 也表示 APK 内的位置（相对 assets/models/）。
@@ -44,18 +44,18 @@ public final class ModelsManifest {
             "zipformer-en/joiner-epoch-99-avg-1-chunk-16-left-128.int8.onnx",
             "zipformer-en/tokens.txt");
 
-    // ---- CTranslate2 Marian/OPUS-MT 英中 int8：固定离线翻译模型 ----
+    // ---- CTranslate2 Marian/OPUS-MT 英中 int8：已废弃，改用 llama.cpp 本机 API 翻译 ----
     public static final Model OPUS_MT_EN_ZH = new Model(
-            "opus-mt-en-zh", "OPUS-MT English→Chinese (int8)", true,
+            "opus-mt-en-zh", "OPUS-MT English→Chinese (int8)", false,
             "opus-mt-en-zh/model.bin",
             "opus-mt-en-zh/config.json",
             "opus-mt-en-zh/shared_vocabulary.json",
             "opus-mt-en-zh/source.spm",
             "opus-mt-en-zh/target.spm");
 
-    /** 启动必需：VAD、SenseVoice 英文识别与英中翻译模型。 */
+    /** 启动必需：VAD、SenseVoice 英文识别。翻译由本机 llama.cpp API 完成。 */
     public static Model[] required() {
-        return new Model[]{VAD, SENSEVOICE, OPUS_MT_EN_ZH};
+        return new Model[]{VAD, SENSEVOICE};
     }
 
     /** 模型条目：files 是相对路径，archive 那套下载/解压逻辑已经随离线打包去掉了。 */
